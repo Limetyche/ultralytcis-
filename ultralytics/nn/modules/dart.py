@@ -112,7 +112,9 @@ class DARTDetect(Detect):
         self.hidden_dim = int(hidden_dim)
         self.use_distribution_state = bool(use_distribution_state)
         self.scale_adaptive = bool(scale_adaptive)
-        self.state_encoder = DistributionStateEncoder(self.reg_max, detach=True) if self.use_distribution_state else None
+        self.state_encoder = (
+            DistributionStateEncoder(self.reg_max, detach=True) if self.use_distribution_state else None
+        )
         # P3/P4 retain dense nearest-neighbour sampling. P5 uses dilation 2 to expose uncertain large-object
         # edges to wider context at negligible parameter cost; the shared-scale control uses dilation 1 everywhere.
         dilations: Sequence[int] = (1, 1, 2) if self.scale_adaptive else (1, 1, 1)
