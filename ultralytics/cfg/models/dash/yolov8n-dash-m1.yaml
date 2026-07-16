@@ -34,4 +34,9 @@ head:
   - [-1, 3, C2f, [1024]]
   # nc, latent, semantic_edges, geometry_edges, grids, semantic, geometry,
   # cross_scale, dense_readout, gamma_init, share_hypergraph, return_stats
-  - [[15, 18, 21], 1, DASHDetect, [nc, 48, 12, 8, [[12, 12], [8, 8], [4, 4]], true, true, true, true, 0.05, false, true]]
+  - [
+      [15, 18, 21],
+      1,
+      DASHDetect,
+      [nc, 48, 12, 8, [[12, 12], [8, 8], [4, 4]], true, true, true, true, 0.05, false, true],
+    ]
