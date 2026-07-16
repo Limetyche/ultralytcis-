@@ -45,7 +45,7 @@ class MultiScaleAnchorEncoder(nn.Module):
             zip(feats, self.input_proj, self.input_norm, self.anchor_grid_sizes)
         ):
             z = norm(proj(feat))
-            b, _, h, w = z.shape
+            _b, _, h, w = z.shape
             xy = _coordinate_grid(h, w, z.device, z.dtype)
             pos = self.coordinate_mlp(xy).transpose(0, 1).reshape(1, self.latent_dim, h, w)
             z = z + pos + self.scale_embedding[level].view(1, -1, 1, 1)
@@ -260,8 +260,10 @@ class DASHRoutingBlock(nn.Module):
         for message_target, grid_size in zip(dense, grid_sizes):
             gh, gw = int(grid_size[0]), int(grid_size[1])
             count = gh * gw
-            msg = anchor_messages[:, start : start + count].transpose(1, 2).reshape(
-                anchor_messages.shape[0], anchor_messages.shape[-1], gh, gw
+            msg = (
+                anchor_messages[:, start : start + count]
+                .transpose(1, 2)
+                .reshape(anchor_messages.shape[0], anchor_messages.shape[-1], gh, gw)
             )
             outputs.append(F.interpolate(msg, message_target.shape[-2:], mode="bilinear", align_corners=False))
             start += count
@@ -284,9 +286,7 @@ class DASHRoutingBlock(nn.Module):
                     dense, semantic_edges, dense_xy, enable_cross_scale=self.enable_cross_scale
                 )
             else:
-                cls_delta = self._anchor_broadcast(
-                    semantic_anchor_messages, actual_grid_sizes, dense
-                )
+                cls_delta = self._anchor_broadcast(semantic_anchor_messages, actual_grid_sizes, dense)
 
         edge_xy = None
         if self.enable_geometry:
@@ -302,9 +302,7 @@ class DASHRoutingBlock(nn.Module):
                 )
                 edge_xy = learned_edge_xy.unsqueeze(0).expand(tokens.shape[0], -1, -1)
             geometry_anchor_messages = (
-                torch.bmm(reg_incidence, geometry_edges.float()).to(tokens.dtype)
-                if not self.dense_readout
-                else None
+                torch.bmm(reg_incidence, geometry_edges.float()).to(tokens.dtype) if not self.dense_readout else None
             )
             if self.dense_readout:
                 reg_delta, reg_weights = self.geometry_readout(
@@ -315,9 +313,7 @@ class DASHRoutingBlock(nn.Module):
                     enable_cross_scale=self.enable_cross_scale,
                 )
             else:
-                reg_delta = self._anchor_broadcast(
-                    geometry_anchor_messages, actual_grid_sizes, dense
-                )
+                reg_delta = self._anchor_broadcast(geometry_anchor_messages, actual_grid_sizes, dense)
 
         cls_feats, reg_feats = self._apply_residuals(feats, cls_delta, reg_delta)
 
@@ -372,10 +368,7 @@ class DASHRoutingBlock(nn.Module):
             "geometry_router_linear": int(self.enable_geometry)
             * (4 * tokens * dim * dim + 3 * geometry_edges * dim * dim + 2 * tokens * dim),
             "anchor_incidence_bmm": 2 * tokens * (semantic_edges + geometry_edges) * dim,
-            "dense_query_projection": dense_nodes
-            * dim
-            * dim
-            * (int(self.enable_semantic) + int(self.enable_geometry)),
+            "dense_query_projection": dense_nodes * dim * dim * (int(self.enable_semantic) + int(self.enable_geometry)),
             "dense_edge_key_value": 2 * (semantic_edges + geometry_edges) * dim * dim,
             "dense_readout_bmm": 2 * dense_nodes * (semantic_edges + geometry_edges) * dim,
             "residual_adapters": 2 * sum(h * w * c * dim for c, h, w in shapes),
