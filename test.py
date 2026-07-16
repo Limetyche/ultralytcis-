@@ -1,4 +1,5 @@
 import torch
+
 from ultralytics import YOLO
 
 model = YOLO("/content/drive/MyDrive/ultralytics/ultralytics/cfg/models/13/yolo13.yaml").model.cuda().train()
@@ -12,7 +13,10 @@ scaler = torch.amp.GradScaler("cuda")
 
 for step in range(100):
     x = torch.randn(
-        2, 3, 640, 640,
+        2,
+        3,
+        640,
+        640,
         device="cuda",
     )
 
@@ -39,15 +43,10 @@ for step in range(100):
 
         collect(outputs)
 
-        loss = sum(
-            t.float().square().mean()
-            for t in tensors
-        )
+        loss = sum(t.float().square().mean() for t in tensors)
 
     if not torch.isfinite(loss):
-        raise RuntimeError(
-            f"Non-finite loss at step {step}"
-        )
+        raise RuntimeError(f"Non-finite loss at step {step}")
 
     scaler.scale(loss).backward()
     scaler.unscale_(optimizer)
@@ -55,9 +54,7 @@ for step in range(100):
     for name, p in model.named_parameters():
         if p.grad is not None:
             if not torch.isfinite(p.grad).all():
-                raise RuntimeError(
-                    f"Bad grad at step {step}: {name}"
-                )
+                raise RuntimeError(f"Bad grad at step {step}: {name}")
 
     torch.nn.utils.clip_grad_norm_(
         model.parameters(),
