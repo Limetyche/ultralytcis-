@@ -10,7 +10,6 @@ import yaml
 from ultralytics.nn.modules.dash import DASHRoutingBlock
 from ultralytics.nn.tasks import DetectionModel
 
-
 YAML_PATH = Path("ultralytics/cfg/models/dash/yolov8n-dash-m1.yaml")
 
 
