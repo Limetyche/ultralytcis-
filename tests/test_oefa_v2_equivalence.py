@@ -2,6 +2,7 @@
 
 from copy import deepcopy
 
+import pytest
 import torch
 
 from ultralytics import YOLO
@@ -13,6 +14,15 @@ from ultralytics.nn.modules.oefa_v2 import EvidenceTargetGeneratorV2, OEFAGuided
 
 IDENTITY = "ultralytics/cfg/models/oefa/yolo11n-oefa-identity-v2.yaml"
 M1 = "ultralytics/cfg/models/oefa/yolo11n-oefa-m1-v2.yaml"
+
+
+def make_small_detection_batch(batch_size=2):
+    return {
+        "img": torch.rand(batch_size, 3, 64, 64),
+        "batch_idx": torch.arange(batch_size),
+        "cls": torch.arange(batch_size).remainder(3).view(-1, 1).float(),
+        "bboxes": torch.tensor([[0.5, 0.5, 0.2, 0.2]]).repeat(batch_size, 1),
+    }
 
 
 def test_v2_native_detect_and_identity_size():
@@ -61,8 +71,52 @@ def test_vector_target_generator_fp32_equivalence():
 def test_m1_v2_loss_and_finite_gradients():
     model = YOLO(M1).model.train()
     model.args = get_cfg()
-    batch = {"img": torch.rand(2,3,64,64), "batch_idx": torch.tensor([0,1]),
-             "cls": torch.tensor([[0.],[1.]]), "bboxes": torch.tensor([[.5,.5,.2,.2],[.4,.4,.1,.1]])}
-    loss, _ = model(batch)
+    batch = make_small_detection_batch()
+    loss, items = model(batch)
     loss.backward()
-    assert torch.isfinite(loss) and all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)
+    assert torch.isfinite(loss) and torch.isfinite(items).all()
+    parameters = dict(model.named_parameters())
+    required = (
+        "model.11.predictor.3.weight",
+        "model.12.offset_mixer.weight",
+        "model.12.alpha",
+        "model.18.geometry.3.weight",
+        "model.18.gate.weight",
+    )
+    assert all(parameters[name].grad is not None and torch.isfinite(parameters[name].grad).all() for name in required)
+
+
+def test_m1_v2_training_requires_evidence():
+    model = YOLO(M1).model.train()
+    model.args = get_cfg()
+    batch = make_small_detection_batch()
+    preds = model(batch["img"]); preds.pop("evidence")
+    with pytest.raises(RuntimeError, match="evidence is missing"):
+        model.loss(batch, preds)
+
+
+def test_m1_v2_eval_forward_and_loss_without_evidence():
+    model = YOLO(M1).model
+    model.args = get_cfg()
+    batch = make_small_detection_batch()
+    model.eval()
+    with torch.no_grad():
+        preds = model(batch["img"])
+        assert isinstance(preds, tuple) and "evidence" not in preds[1]
+        loss, items = model.loss(batch, preds)
+    assert torch.isfinite(loss) and torch.isfinite(items).all() and items.numel() == 3
+
+
+def test_m1_v2_train_to_validator_loss_lifecycle():
+    model = YOLO(M1).model
+    model.args = get_cfg()
+    batch = make_small_detection_batch()
+    model.train()
+    optimizer = torch.optim.SGD(model.parameters(), lr=1e-3)
+    optimizer.zero_grad(set_to_none=True)
+    model(batch)[0].backward()
+    optimizer.step()
+    model.eval()
+    with torch.no_grad():
+        loss, items = model.loss(batch, model(batch["img"]))
+    assert torch.isfinite(loss) and torch.isfinite(items).all() and items.shape == (3,)

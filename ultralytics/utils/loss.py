@@ -567,7 +567,16 @@ class OEFAM1V2DetectionLoss(v8DetectionLoss):
     def __call__(self, preds, batch):
         preds = self.parse_output(preds)
         det_total, det_items = self.loss(preds, batch)
-        evidence = preds["evidence"]
+        evidence = preds.get("evidence")
+        if evidence is None:
+            if torch.is_grad_enabled() and self.lambda_evidence > 0:
+                raise RuntimeError(
+                    "OEFA evidence is missing while gradients are enabled. "
+                    "The V2 training forward path or oefa_evidence_layer is broken."
+                )
+            # Native Detect intentionally keeps its standard eval API. Trainer validation reuses that inference output
+            # for the ordinary three-component detection loss, without recomputing the OEFA auxiliary objective.
+            return det_total.sum(), det_items
         centers, boundaries = self.target_generator(batch["batch_idx"].long(), batch["bboxes"],
             preds["boxes"].shape[0], [z.shape for z in evidence["center_logits"]], batch["img"].shape[-2:])
         losses = []
