@@ -52,6 +52,13 @@ __all__ = (
     "ResNetLayer",
     "SCDown",
     "TorchVision",
+    "MASSRUp",
+    "HyperACE",
+    "DownsampleConv",
+    "FullPAD_Tunnel",
+    "DSC3k2",
+    "HGD_Tunnel",
+    "CSHIA",
 )
 
 
@@ -2071,3 +2078,1054 @@ class RealNVP(nn.Module):
             self.float()
         z, log_det = self.backward_p(x)
         return self.prior.log_prob(z) + log_det
+
+import math
+
+class MASSRUp(nn.Module):
+    """
+    MASSRUp: MAS-style Super-Resolution Upsampling
+
+    用于替换 YOLO neck 中的 nn.Upsample。
+
+    结构:
+        base = nearest upsample(x)
+        sr   = PixelShuffle-based feature SR branch(x)
+        out  = base + alpha * sr
+
+    特点:
+        1. 初始接近原始 nearest upsample。
+        2. 不从 nearest 后的伪高频中提纹理。
+        3. 使用 PixelShuffle 做 feature-level super-resolution。
+        4. alpha 初始极小，避免破坏 cls 语义。
+    """
+
+    def __init__(self,
+                 c1,
+                 scale=2,
+                 mode="nearest",
+                 hidden_ratio=0.5,
+                 max_alpha=0.10,
+                 alpha_init=-5.0):
+        super().__init__()
+
+        assert scale == 2, "MASSRUp currently expects scale=2."
+
+        self.c1 = c1
+        self.scale = scale
+        self.mode = mode
+        self.max_alpha = max_alpha
+
+        hidden = max(int(c1 * hidden_ratio), 8)
+
+        # 低分辨率特征压缩/预处理
+        self.pre = nn.Sequential(
+            nn.Conv2d(c1, hidden, 1, 1, 0, bias=False),
+            nn.BatchNorm2d(hidden),
+            nn.SiLU(inplace=True)
+        )
+
+        # sub-pixel expand: hidden -> c1 * scale^2
+        self.expand = nn.Sequential(
+            nn.Conv2d(hidden, c1 * scale * scale, 1, 1, 0, bias=False),
+            nn.BatchNorm2d(c1 * scale * scale),
+            nn.SiLU(inplace=True)
+        )
+
+        # PixelShuffle: [B, c1*4, H, W] -> [B, c1, 2H, 2W]
+        self.shuffle = nn.PixelShuffle(scale)
+
+        # 上采样后轻量 refine
+        self.refine = nn.Sequential(
+            nn.Conv2d(c1, c1, 3, 1, 1, groups=c1, bias=False),
+            nn.BatchNorm2d(c1),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(c1, c1, 1, 1, 0, bias=False),
+            nn.BatchNorm2d(c1)
+        )
+
+        # 正值小残差
+        # max_alpha=0.10, alpha_init=-5.0 时 alpha≈0.00067
+        self.alpha_raw = nn.Parameter(torch.tensor(float(alpha_init)))
+
+    def forward(self, x):
+        # 1. 原始 nearest upsample 保底
+        if self.mode in ("nearest", "nearest-exact", "area"):
+            base = F.interpolate(x, scale_factor=self.scale, mode=self.mode)
+        else:
+            base = F.interpolate(
+                x,
+                scale_factor=self.scale,
+                mode=self.mode,
+                align_corners=False
+            )
+
+        # 2. feature super-resolution 分支
+        sr = self.pre(x)
+        sr = self.expand(sr)
+        sr = self.shuffle(sr)
+        sr = self.refine(sr)
+
+        # 3. 防止尺寸因为奇偶数出现偏差
+        if sr.shape[-2:] != base.shape[-2:]:
+            sr = F.interpolate(sr, size=base.shape[-2:], mode="nearest")
+
+        # 4. 小残差加回
+        alpha = self.max_alpha * torch.sigmoid(self.alpha_raw)
+
+        return base + alpha * sr
+
+class MASDown(nn.Module):
+    """
+    MASDown V3-R: Recall-friendly Texture-Enhanced ConvDown
+
+    YAML 推荐写法:
+    - [-1, 1, MASDown, [256, 3, 2]]
+    - [-1, 1, MASDown, [256, 3, 2, 0.25, 0.05, -2.0]]
+
+    参数顺序:
+        c2, k, s, max_beta, gate_floor, beta_init
+    """
+
+    def __init__(self, c1, c2, k=3, s=2,
+                 max_beta=0.25, gate_floor=0.10, beta_init=-2.0,
+                 p=None, g=1, d=1, act=True):
+        super().__init__()
+
+        assert s == 2, "MASDown is designed for stride=2 downsampling."
+
+        if p is None or isinstance(p, float):
+            p = k // 2
+
+        if not isinstance(g, int) or g < 1:
+            g = 1
+
+        self.c1 = c1
+        self.c2 = c2
+        self.max_beta = max_beta
+        self.gate_floor = gate_floor
+
+        # 保持 Ultralytics Conv 风格，方便预训练权重匹配
+        self.conv = nn.Conv2d(c1, c2, k, s, p, groups=g, dilation=d, bias=False)
+        self.bn = nn.BatchNorm2d(c2)
+        self.act = nn.SiLU(inplace=True) if act else nn.Identity()
+
+        hidden = max(c1 // 4, 8)
+
+        # channel-aware texture gate
+        self.gate_pred = nn.Sequential(
+            nn.Conv2d(c1 * 2, hidden, 1, 1, 0, bias=False),
+            nn.BatchNorm2d(hidden),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(hidden, c1, 1, 1, 0, bias=True),
+            nn.Sigmoid()
+        )
+
+        # 正值 beta
+        self.beta_raw = nn.Parameter(torch.tensor(float(beta_init)))
+
+    def _texture_stats(self, x):
+        mean = F.avg_pool2d(x, kernel_size=3, stride=1, padding=1)
+
+        # 保留正负高频方向
+        high_freq = x - mean
+
+        var = F.avg_pool2d(high_freq ** 2, kernel_size=3, stride=1, padding=1)
+
+        gx = x[:, :, :, 1:] - x[:, :, :, :-1]
+        gy = x[:, :, 1:, :] - x[:, :, :-1, :]
+
+        gx = F.pad(gx, (0, 1, 0, 0))
+        gy = F.pad(gy, (0, 0, 0, 1))
+
+        grad = torch.sqrt(gx ** 2 + gy ** 2 + 1e-6)
+
+        return high_freq, var, grad
+
+    def forward(self, x):
+        high_freq, var, grad = self._texture_stats(x)
+
+        gate = self.gate_pred(torch.cat([var, grad], dim=1))
+
+        if self.gate_floor > 0:
+            gate = self.gate_floor + (1.0 - self.gate_floor) * gate
+
+        beta = self.max_beta * torch.sigmoid(self.beta_raw)
+
+        x_enhanced = x + beta * gate * high_freq
+
+        return self.act(self.bn(self.conv(x_enhanced)))
+
+class DSConv(nn.Module):
+    """The Basic Depthwise Separable Convolution."""
+    def __init__(self, c_in, c_out, k=3, s=1, p=None, d=1, bias=False):
+        super().__init__()
+        if p is None:
+            p = (d * (k - 1)) // 2
+        self.dw = nn.Conv2d(
+            c_in, c_in, kernel_size=k, stride=s,
+            padding=p, dilation=d, groups=c_in, bias=bias
+        )
+        self.pw = nn.Conv2d(c_in, c_out, 1, 1, 0, bias=bias)
+        self.bn = nn.BatchNorm2d(c_out)
+        self.act = nn.SiLU()
+
+    def forward(self, x):
+        x = self.dw(x)
+        x = self.pw(x)
+        return self.act(self.bn(x))
+
+class DSBottleneck(nn.Module):
+    """
+    An improved bottleneck block using depthwise separable convolutions (DSConv).
+
+    This class implements a lightweight bottleneck module that replaces standard convolutions with depthwise
+    separable convolutions to reduce parameters and computational cost.
+
+    Attributes:
+        c1 (int): Number of input channels.
+        c2 (int): Number of output channels.
+        shortcut (bool, optional): Whether to use a residual shortcut connection. The connection is only added if c1 == c2. Defaults to True.
+        e (float, optional): Expansion ratio for the intermediate channels. Defaults to 0.5.
+        k1 (int, optional): Kernel size for the first DSConv layer. Defaults to 3.
+        k2 (int, optional): Kernel size for the second DSConv layer. Defaults to 5.
+        d2 (int, optional): Dilation for the second DSConv layer. Defaults to 1.
+
+    Methods:
+        forward: Performs a forward pass through the DSBottleneck module.
+
+    Examples:
+        >>> import torch
+        >>> model = DSBottleneck(c1=64, c2=64, shortcut=True)
+        >>> x = torch.randn(2, 64, 32, 32)
+        >>> output = model(x)
+        >>> print(output.shape)
+        torch.Size([2, 64, 32, 32])
+    """
+    def __init__(self, c1, c2, shortcut=True, e=0.5, k1=3, k2=5, d2=1):
+        super().__init__()
+        c_ = int(c2 * e)
+        self.cv1 = DSConv(c1, c_, k1, s=1, p=None, d=1)
+        self.cv2 = DSConv(c_, c2, k2, s=1, p=None, d=d2)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x):
+        y = self.cv2(self.cv1(x))
+        return x + y if self.add else y
+
+class DSC3k(C3):
+    """
+    An improved C3k module using DSBottleneck blocks for lightweight feature extraction.
+
+    This class extends the C3 module by replacing its standard bottleneck blocks with DSBottleneck blocks,
+    which use depthwise separable convolutions.
+
+    Attributes:
+        c1 (int): Number of input channels.
+        c2 (int): Number of output channels.
+        n (int, optional): Number of DSBottleneck blocks to stack. Defaults to 1.
+        shortcut (bool, optional): Whether to use shortcut connections within the DSBottlenecks. Defaults to True.
+        g (int, optional): Number of groups for grouped convolution (passed to parent C3). Defaults to 1.
+        e (float, optional): Expansion ratio for the C3 module's hidden channels. Defaults to 0.5.
+        k1 (int, optional): Kernel size for the first DSConv in each DSBottleneck. Defaults to 3.
+        k2 (int, optional): Kernel size for the second DSConv in each DSBottleneck. Defaults to 5.
+        d2 (int, optional): Dilation for the second DSConv in each DSBottleneck. Defaults to 1.
+
+    Methods:
+        forward: Performs a forward pass through the DSC3k module (inherited from C3).
+
+    Examples:
+        >>> import torch
+        >>> model = DSC3k(c1=128, c2=128, n=2, k1=3, k2=7)
+        >>> x = torch.randn(2, 128, 64, 64)
+        >>> output = model(x)
+        >>> print(output.shape)
+        torch.Size([2, 128, 64, 64])
+    """
+    def __init__(
+        self,
+        c1,
+        c2,
+        n=1,
+        shortcut=True,
+        g=1,
+        e=0.5,
+        k1=3,
+        k2=5,
+        d2=1
+    ):
+        super().__init__(c1, c2, n, shortcut, g, e)
+        c_ = int(c2 * e)
+
+        self.m = nn.Sequential(
+            *(
+                DSBottleneck(
+                    c_, c_,
+                    shortcut=shortcut,
+                    e=1.0,
+                    k1=k1,
+                    k2=k2,
+                    d2=d2
+                )
+                for _ in range(n)
+            )
+        )
+
+class DSC3k2(C2f):
+    """
+    An improved C3k2 module that uses lightweight depthwise separable convolution blocks.
+
+    This class redesigns C3k2 module, replacing its internal processing blocks with either DSBottleneck
+    or DSC3k modules.
+
+    Attributes:
+        c1 (int): Number of input channels.
+        c2 (int): Number of output channels.
+        n (int, optional): Number of internal processing blocks to stack. Defaults to 1.
+        dsc3k (bool, optional): If True, use DSC3k as the internal block. If False, use DSBottleneck. Defaults to False.
+        e (float, optional): Expansion ratio for the C2f module's hidden channels. Defaults to 0.5.
+        g (int, optional): Number of groups for grouped convolution (passed to parent C2f). Defaults to 1.
+        shortcut (bool, optional): Whether to use shortcut connections in the internal blocks. Defaults to True.
+        k1 (int, optional): Kernel size for the first DSConv in internal blocks. Defaults to 3.
+        k2 (int, optional): Kernel size for the second DSConv in internal blocks. Defaults to 7.
+        d2 (int, optional): Dilation for the second DSConv in internal blocks. Defaults to 1.
+
+    Methods:
+        forward: Performs a forward pass through the DSC3k2 module (inherited from C2f).
+
+    Examples:
+        >>> import torch
+        >>> # Using DSBottleneck as internal block
+        >>> model1 = DSC3k2(c1=64, c2=64, n=2, dsc3k=False)
+        >>> x = torch.randn(2, 64, 128, 128)
+        >>> output1 = model1(x)
+        >>> print(f"With DSBottleneck: {output1.shape}")
+        With DSBottleneck: torch.Size([2, 64, 128, 128])
+        >>> # Using DSC3k as internal block
+        >>> model2 = DSC3k2(c1=64, c2=64, n=1, dsc3k=True)
+        >>> output2 = model2(x)
+        >>> print(f"With DSC3k: {output2.shape}")
+        With DSC3k: torch.Size([2, 64, 128, 128])
+    """
+    def __init__(
+        self,
+        c1,
+        c2,
+        n=1,
+        dsc3k=False,
+        e=0.5,
+        g=1,
+        shortcut=True,
+        k1=3,
+        k2=7,
+        d2=1
+    ):
+        super().__init__(c1, c2, n, shortcut, g, e)
+        if dsc3k:
+            self.m = nn.ModuleList(
+                DSC3k(
+                    self.c, self.c,
+                    n=2,
+                    shortcut=shortcut,
+                    g=g,
+                    e=1.0,
+                    k1=k1,
+                    k2=k2,
+                    d2=d2
+                )
+                for _ in range(n)
+            )
+        else:
+            self.m = nn.ModuleList(
+                DSBottleneck(
+                    self.c, self.c,
+                    shortcut=shortcut,
+                    e=1.0,
+                    k1=k1,
+                    k2=k2,
+                    d2=d2
+                )
+                for _ in range(n)
+            )
+
+class AdaHyperedgeGen(nn.Module):
+    def __init__(
+        self,
+        node_dim,
+        num_hyperedges,
+        num_heads=4,
+        dropout=0.1,
+        context="both",
+        temperature=1.0,
+        offset_scale=0.25,
+    ):
+        super().__init__()
+
+        if node_dim % num_heads != 0:
+            raise ValueError(
+                f"node_dim={node_dim} must be divisible by "
+                f"num_heads={num_heads}"
+            )
+
+        if context not in ("mean", "max", "both"):
+            raise ValueError(
+                f"Unsupported context '{context}'"
+            )
+
+        self.num_heads = num_heads
+        self.num_hyperedges = num_hyperedges
+        self.head_dim = node_dim // num_heads
+        self.context = context
+        self.temperature = max(float(temperature), 1e-4)
+        self.offset_scale = float(offset_scale)
+
+        self.input_norm = nn.LayerNorm(node_dim)
+
+        self.prototype_base = nn.Parameter(
+            torch.empty(num_hyperedges, node_dim)
+        )
+        nn.init.xavier_uniform_(self.prototype_base)
+
+        context_dim = (
+            node_dim
+            if context in ("mean", "max")
+            else 2 * node_dim
+        )
+
+        self.context_net = nn.Sequential(
+            nn.Linear(context_dim, node_dim),
+            nn.SiLU(),
+            nn.Linear(
+                node_dim,
+                num_hyperedges * node_dim,
+            ),
+        )
+
+        nn.init.zeros_(self.context_net[-1].weight)
+        nn.init.zeros_(self.context_net[-1].bias)
+
+        self.pre_head_proj = nn.Linear(
+            node_dim,
+            node_dim,
+            bias=False,
+        )
+
+        self.logit_scale = nn.Parameter(
+            torch.tensor(0.0)
+        )
+
+    def forward(self, X):
+        B, N, D = X.shape
+
+        X_norm = self.input_norm(X)
+
+        if self.context == "mean":
+            context_cat = X_norm.mean(dim=1)
+
+        elif self.context == "max":
+            context_cat = X_norm.amax(dim=1)
+
+        else:
+            context_cat = torch.cat(
+                [
+                    X_norm.mean(dim=1),
+                    X_norm.amax(dim=1),
+                ],
+                dim=-1,
+            )
+
+        # 限制动态原型偏移，避免训练后无限增长
+        offsets = self.context_net(context_cat)
+        offsets = self.offset_scale * torch.tanh(offsets)
+
+        offsets = offsets.view(
+            B,
+            self.num_hyperedges,
+            D,
+        )
+
+        prototypes = (
+            self.prototype_base.unsqueeze(0)
+            + offsets
+        )
+
+        X_proj = self.pre_head_proj(X_norm)
+
+        X_heads = X_proj.view(
+            B,
+            N,
+            self.num_heads,
+            self.head_dim,
+        ).transpose(1, 2)
+
+        proto_heads = prototypes.view(
+            B,
+            self.num_hyperedges,
+            self.num_heads,
+            self.head_dim,
+        ).permute(0, 2, 1, 3)
+
+        X_heads = F.normalize(
+            X_heads.float(),
+            dim=-1,
+            eps=1e-4,
+        )
+
+        proto_heads = F.normalize(
+            proto_heads.float(),
+            dim=-1,
+            eps=1e-4,
+        )
+
+        logits = torch.matmul(
+            X_heads,
+            proto_heads.transpose(-1, -2),
+        )
+
+        logits = logits.mean(dim=1)
+
+        # 先 clamp，再 exp
+        scale = self.logit_scale.clamp(
+            min=-2.3,
+            max=3.0,
+        ).exp()
+
+        logits = (
+            logits
+            * scale
+            / self.temperature
+        )
+
+        # A 始终保持 FP32，并且不做 membership dropout
+        A = F.softmax(
+            logits,
+            dim=-1,
+            dtype=torch.float32,
+        )
+
+        return A
+
+class AdaHGConv(nn.Module):
+    """
+    Stable adaptive hypergraph convolution with explicit degree normalization.
+    """
+
+    def __init__(
+        self,
+        embed_dim,
+        num_hyperedges=16,
+        num_heads=4,
+        dropout=0.1,
+        context="both",
+        init=0.0,
+        # init=-4.0,
+    ):
+        super().__init__()
+
+        self.edge_generator = AdaHyperedgeGen(
+            node_dim=embed_dim,
+            num_hyperedges=num_hyperedges,
+            num_heads=num_heads,
+            dropout=dropout,
+            context=context,
+        )
+
+        self.edge_norm = nn.LayerNorm(embed_dim)
+        self.node_norm = nn.LayerNorm(embed_dim)
+
+        self.edge_proj = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.GELU(),
+        )
+
+        self.node_proj = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.GELU(),
+        )
+
+        self.message_dropout = nn.Dropout(dropout)
+
+        # 初始近似 Identity，避免超图分支直接主导
+        self.gamma = nn.Parameter(torch.tensor(float(init)))
+
+    def forward(self, X):
+        # X 可能是：
+        # 训练阶段 float32
+        # AMP/验证阶段 float16
+        input_dtype = X.dtype
+
+        # A 保持 FP32
+        A = self.edge_generator(X)
+
+        X32 = X.float()
+        A32 = A.float()
+
+        # -------------------------
+        # Vertex -> Hyperedge
+        # -------------------------
+        edge_degree = A32.sum(
+            dim=1,
+            keepdim=False,
+        ).clamp_min(1e-4)
+
+        He = torch.bmm(
+            A32.transpose(1, 2),
+            X32,
+        )
+
+        He = He / edge_degree.unsqueeze(-1)
+
+        # 非参数聚合使用 FP32，
+        # 进入 LayerNorm/Linear 前恢复模型 dtype
+        He = He.to(dtype=input_dtype)
+
+        He = self.edge_norm(He)
+        He = self.edge_proj(He)
+
+        # -------------------------
+        # Hyperedge -> Vertex
+        # -------------------------
+        # bmm 累积使用 FP32
+        X_msg = torch.bmm(
+            A32,
+            He.float(),
+        )
+
+        # 进入带参数模块前恢复 dtype
+        X_msg = X_msg.to(dtype=input_dtype)
+
+        X_msg = self.node_norm(X_msg)
+        X_msg = self.node_proj(X_msg)
+        X_msg = self.message_dropout(X_msg)
+
+        gate = torch.sigmoid(self.gamma)
+
+        # gamma 在 model.half() 后也是 FP16，类型一致
+        return X + gate * X_msg
+
+class AdaHGComputation(nn.Module):
+    """
+    A wrapper module for applying adaptive hypergraph convolution to 4D feature maps.
+
+    This class makes the hypergraph convolution compatible with standard CNN architectures. It flattens a
+    4D input tensor (B, C, H, W) into a sequence of vertices (tokens), applies the AdaHGConv layer to
+    model high-order correlations, and then reshapes the output back into a 4D tensor.
+
+    Attributes:
+        embed_dim (int): The feature dimension of the vertices (equivalent to input channels C).
+        num_hyperedges (int, optional): The number of hyperedges for the underlying AdaHGConv. Defaults to 16.
+        num_heads (int, optional): The number of attention heads for the underlying AdaHGConv. Defaults to 8.
+        dropout (float, optional): The dropout rate for the underlying AdaHGConv. Defaults to 0.1.
+        context (str, optional): The context type for the underlying AdaHGConv. Defaults to "both".
+
+    Methods:
+        forward: Processes a 4D feature map through the adaptive hypergraph computation layer.
+
+    Examples:
+        >>> import torch
+        >>> model = AdaHGComputation(embed_dim=64, num_hyperedges=8, num_heads=4)
+        >>> x = torch.randn(2, 64, 32, 32) # (B, C, H, W)
+        >>> output = model(x)
+        >>> print(output.shape)
+        torch.Size([2, 64, 32, 32])
+    """
+    def __init__(self, embed_dim, num_hyperedges=16, num_heads=8, dropout=0.1, context="both"):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.hgnn = AdaHGConv(
+            embed_dim=embed_dim,
+            num_hyperedges=num_hyperedges,
+            num_heads=num_heads,
+            dropout=dropout,
+            context=context
+        )
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        tokens = x.flatten(2).transpose(1, 2)
+        tokens = self.hgnn(tokens)
+        x_out = tokens.transpose(1, 2).view(B, C, H, W)
+        return x_out
+
+class C3AH(nn.Module):
+    def __init__(
+        self,
+        c1,
+        c2,
+        e=1.0,
+        num_hyperedges=8,
+        context="both",
+    ):
+        super().__init__()
+
+        c_ = int(c2 * e)
+        assert c_ % 16 == 0
+
+        num_heads = c_ // 16
+
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c1, c_, 1, 1)
+
+        self.m = AdaHGComputation(
+            embed_dim=c_,
+            num_hyperedges=num_hyperedges,
+            num_heads=num_heads,
+            dropout=0.1,
+            context=context,
+        )
+
+        self.cv3 = Conv(2 * c_, c2, 1)
+
+    def forward(self, x):
+        hyper = self.m(self.cv1(x))
+        local = self.cv2(x)
+        return self.cv3(torch.cat((hyper, local), dim=1))
+
+class FuseModule(nn.Module):
+    """
+    A module to fuse multi-scale features for the HyperACE block.
+
+    This module takes a list of three feature maps from different scales, aligns them to a common
+    spatial resolution by downsampling the first and upsampling the third, and then concatenates
+    and fuses them with a convolution layer.
+
+    Attributes:
+        c_in (int): The number of channels of the input feature maps.
+        channel_adjust (bool): Whether to adjust the channel count of the concatenated features.
+
+    Methods:
+        forward: Fuses a list of three multi-scale feature maps.
+
+    Examples:
+        >>> import torch
+        >>> model = FuseModule(c_in=64, channel_adjust=False)
+        >>> # Input is a list of features from different backbone stages
+        >>> x_list = [torch.randn(2, 64, 64, 64), torch.randn(2, 64, 32, 32), torch.randn(2, 64, 16, 16)]
+        >>> output = model(x_list)
+        >>> print(output.shape)
+        torch.Size([2, 64, 32, 32])
+    """
+    def __init__(self, c_in, channel_adjust):
+        super(FuseModule, self).__init__()
+        self.downsample = nn.AvgPool2d(kernel_size=2)
+        self.upsample = nn.Upsample(scale_factor=2, mode='nearest')
+        if channel_adjust:
+            self.conv_out = Conv(4 * c_in, c_in, 1)
+        else:
+            self.conv_out = Conv(3 * c_in, c_in, 1)
+
+    def forward(self, x):
+        x1_ds = self.downsample(x[0])
+        x3_up = self.upsample(x[2])
+        x_cat = torch.cat([x1_ds, x[1], x3_up], dim=1)
+        out = self.conv_out(x_cat)
+        return out
+
+class HyperACE(nn.Module):
+    def __init__(
+        self,
+        c1,
+        c2,
+        n=1,
+        num_hyperedges=8,
+        dsc3k=True,
+        shortcut=False,
+        e1=0.5,
+        e2=1,
+        context="both",
+        channel_adjust=True,
+        init=-4.0,
+    ):
+        super().__init__()
+
+        self.c = int(c2 * e1)
+        self.cv1 = Conv(c1, 3 * self.c, 1, 1)
+        self.cv2 = Conv((4 + n) * self.c, c2, 1)
+
+        self.m = nn.ModuleList(
+            DSC3k(
+                self.c,
+                self.c,
+                2,
+                shortcut,
+                k1=3,
+                k2=7,
+            )
+            if dsc3k
+            else DSBottleneck(
+                self.c,
+                self.c,
+                shortcut=shortcut,
+            )
+            for _ in range(n)
+        )
+
+        self.fuse = FuseModule(c1, channel_adjust)
+
+        self.branch1 = C3AH(
+            self.c,
+            self.c,
+            e2,
+            num_hyperedges,
+            context,
+        )
+        self.branch2 = C3AH(
+            self.c,
+            self.c,
+            e2,
+            num_hyperedges,
+            context,
+        )
+
+        self.alpha1 = nn.Parameter(torch.tensor(float(init)))
+        self.alpha2 = nn.Parameter(torch.tensor(float(init)))
+
+    def forward(self, X):
+        x = self.fuse(X)
+        y = list(self.cv1(x).chunk(3, dim=1))
+
+        source = y[1]
+
+        branch1 = self.branch1(source)
+        branch2 = self.branch2(source)
+
+        out1 = source + torch.sigmoid(self.alpha1) * (branch1 - source)
+        out2 = source + torch.sigmoid(self.alpha2) * (branch2 - source)
+
+        y.extend(m(y[-1]) for m in self.m)
+        y[1] = out1
+        y.append(out2)
+
+        return self.cv2(torch.cat(y, dim=1))
+
+class DownsampleConv(nn.Module):
+    """
+    A simple downsampling block with optional channel adjustment.
+
+    This module uses average pooling to reduce the spatial dimensions (H, W) by a factor of 2. It can
+    optionally include a 1x1 convolution to adjust the number of channels, typically doubling them.
+
+    Attributes:
+        in_channels (int): The number of input channels.
+        channel_adjust (bool, optional): If True, a 1x1 convolution doubles the channel dimension. Defaults to True.
+
+    Methods:
+        forward: Performs the downsampling and optional channel adjustment.
+
+    Examples:
+        >>> import torch
+        >>> model = DownsampleConv(in_channels=64, channel_adjust=True)
+        >>> x = torch.randn(2, 64, 32, 32)
+        >>> output = model(x)
+        >>> print(output.shape)
+        torch.Size([2, 128, 16, 16])
+    """
+    def __init__(self, in_channels, channel_adjust=True):
+        super().__init__()
+        self.downsample = nn.AvgPool2d(kernel_size=2)
+        if channel_adjust:
+            self.channel_adjust = Conv(in_channels, in_channels * 2, 1)
+        else:
+            self.channel_adjust = nn.Identity()
+
+    def forward(self, x):
+        return self.channel_adjust(self.downsample(x))
+
+class FullPAD_Tunnel(nn.Module):
+    """
+    A gated fusion module for the Full-Pipeline Aggregation-and-Distribution (FullPAD) paradigm.
+
+    This module implements a gated residual connection used to fuse features. It takes two inputs: the original
+    feature map and a correlation-enhanced feature map. It then computes `output = original + gate * enhanced`,
+    where `gate` is a learnable scalar parameter that adaptively balances the contribution of the enhanced features.
+
+    Methods:
+        forward: Performs the gated fusion of two input feature maps.
+
+    Examples:
+        >>> import torch
+        >>> model = FullPAD_Tunnel()
+        >>> original_feature = torch.randn(2, 64, 32, 32)
+        >>> enhanced_feature = torch.randn(2, 64, 32, 32)
+        >>> output = model([original_feature, enhanced_feature])
+        >>> print(output.shape)
+        torch.Size([2, 64, 32, 32])
+    """
+    def __init__(self):
+        super().__init__()
+        self.gate = nn.Parameter(torch.tensor(0.0))
+    def forward(self, x):
+        out = x[0] + self.gate * x[1]
+        return out
+
+class HGD_Tunnel(nn.Module):
+    """
+    HyperGraph-guided Distribution Tunnel.
+    Replace scalar FullPAD gate with channel-spatial adaptive distribution.
+    """
+    def __init__(self, c, r=8, init=-4.0):
+        super().__init__()
+        hidden = max(c // r, 16)
+
+        # 对增强分支先做轻量局部对齐，避免直接注入造成错位/噪声
+        self.align = nn.Sequential(
+            nn.Conv2d(c, c, 3, 1, 1, groups=c, bias=False),
+            nn.BatchNorm2d(c),
+            nn.SiLU(),
+            nn.Conv2d(c, c, 1, 1, 0, bias=False),
+            nn.BatchNorm2d(c),
+        )
+
+        # 通道 gate：判断哪些通道需要超图增强
+        self.channel_gate = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(c * 3, hidden, 1, bias=True),
+            nn.SiLU(),
+            nn.Conv2d(hidden, c, 1, bias=True),
+        )
+
+        # 空间 gate：判断哪些位置需要超图增强
+        self.spatial_gate = nn.Sequential(
+            nn.Conv2d(c * 3, hidden, 1, bias=False),
+            nn.BatchNorm2d(hidden),
+            nn.SiLU(),
+            nn.Conv2d(hidden, 1, 3, 1, 1, bias=True),
+        )
+
+        # 全局注入强度，初始化很小，保证初始接近 v13-LH
+        self.alpha = nn.Parameter(torch.tensor(init))
+
+    def forward(self, x):
+        base, hyper = x[0], x[1]
+        hyper = self.align(hyper)
+
+        diff = hyper - base
+        z = torch.cat([base, hyper, diff], dim=1)
+
+        cg = self.channel_gate(z)
+        sg = self.spatial_gate(z)
+        gate = torch.sigmoid(cg + sg)
+
+        return base + torch.sigmoid(self.alpha) * gate * hyper
+
+class CSHIA(nn.Module):
+    """
+    Cross-Scale Hypergraph Interaction Aggregation.
+
+    Lightweight cross-scale alignment and hypergraph interaction
+    are performed in a compressed latent space, followed by output
+    projection for feature distribution.
+    """
+
+    def __init__(
+        self,
+        channels,
+        c_out=512,
+        num_hyperedges=4,
+        num_heads=4,
+        dropout=0.0,
+        context="both",
+        init=-4.0,
+        reduction=2,
+    ):
+        super().__init__()
+
+        c3, c4, c5 = channels
+
+        # Nano:
+        # c_out = 512 * 0.25 = 128
+        # c_hidden = 128 / 2 = 64
+        c_hidden = max(c_out // reduction, 16)
+
+        if c_hidden % num_heads != 0:
+            raise ValueError(
+                f"CSHIA hidden channels {c_hidden} must be divisible "
+                f"by num_heads {num_heads}"
+            )
+
+        self.c_out = c_out
+        self.c_hidden = c_hidden
+
+        # P3 -> P4
+        self.align_p3 = nn.Sequential(
+            nn.AvgPool2d(kernel_size=2, stride=2),
+            Conv(c3, c_hidden, 1, 1),
+        )
+
+        # P4 remains at P4 resolution
+        self.align_p4 = Conv(
+            c4,
+            c_hidden,
+            1,
+            1,
+        )
+
+        # Reduce channels before upsampling
+        self.align_p5 = nn.Sequential(
+            Conv(c5, c_hidden, 1, 1),
+            nn.Upsample(
+                scale_factor=2,
+                mode="nearest",
+            ),
+        )
+
+        # Learnable scale aggregation
+        self.scale_logits = nn.Parameter(
+            torch.zeros(3)
+        )
+
+        # Lightweight local branch
+        self.local_branch = Conv(
+            c_hidden,
+            c_hidden,
+            3,
+            1,
+            g=c_hidden,
+        )
+
+        # Stable hypergraph branch works at compressed width
+        self.hyper_branch = AdaHGComputation(
+            embed_dim=c_hidden,
+            num_hyperedges=num_hyperedges,
+            num_heads=num_heads,
+            dropout=dropout,
+            context=context,
+        )
+
+        self.beta = nn.Parameter(
+            torch.tensor(float(init))
+        )
+
+        # Restore output width for the unchanged HGD_Tunnel
+        self.out_proj = Conv(
+            c_hidden,
+            c_out,
+            1,
+            1,
+        )
+
+    def forward(self, x):
+        p3, p4, p5 = x
+
+        p3 = self.align_p3(p3)
+        p4 = self.align_p4(p4)
+        p5 = self.align_p5(p5)
+
+        weights = torch.softmax(
+            self.scale_logits,
+            dim=0,
+        )
+
+        fused = (
+            weights[0] * p3
+            + weights[1] * p4
+            + weights[2] * p5
+        )
+
+        local = self.local_branch(fused)
+        hyper = self.hyper_branch(fused)
+
+        beta = torch.sigmoid(self.beta)
+
+        out = local + beta * (hyper - local)
+
+        return self.out_proj(out)

@@ -59,6 +59,16 @@ from .block import (
     ResNetLayer,
     SCDown,
     TorchVision,
+    MASDown,
+    MASSRUp,
+    DSConv,
+    HyperACE,
+    AdaHGComputation,
+    DownsampleConv,
+    FullPAD_Tunnel,
+    DSC3k2,
+    HGD_Tunnel,
+    CSHIA,
 )
 from .conv import (
     CBAM,
@@ -93,7 +103,28 @@ from .head import (
     YOLOESegment,
     YOLOESegment26,
     v10Detect,
+    HGALDetect,
 )
+from .dash import (
+    DASHDetect,
+    DASHDetectEfficient,
+    DASHDetectM2Lite,
+    DASHRoutingBlock,
+    DASHRoutingBlockEfficient,
+    DenseHyperedgeReadout,
+    GeometryHypergraphRouter,
+    MultiScaleAnchorEncoder,
+    SemanticHypergraphRouter,
+)
+from .dart import DARTDetect, DistributionResidualRefiner, DistributionStateEncoder
+from .oefa import (
+    BoundaryPreservingDownsample,
+    EvidenceGuidedSampler,
+    EvidenceTargetGenerator,
+    ObjectEvidencePredictor,
+    OEFAM1Detect,
+)
+from .oefa_v2 import EvidenceTargetGeneratorV2, OEFABoundaryDownsampleV2, OEFAEvidencePredictorV2, OEFAGuidedSamplerV2
 from .transformer import (
     AIFI,
     MLP,
@@ -153,6 +184,18 @@ __all__ = (
     "DeformableTransformerDecoder",
     "DeformableTransformerDecoderLayer",
     "Detect",
+    "DARTDetect",
+    "DistributionResidualRefiner",
+    "DistributionStateEncoder",
+    "BoundaryPreservingDownsample",
+    "EvidenceGuidedSampler",
+    "EvidenceTargetGenerator",
+    "ObjectEvidencePredictor",
+    "OEFAM1Detect",
+    "EvidenceTargetGeneratorV2",
+    "OEFABoundaryDownsampleV2",
+    "OEFAEvidencePredictorV2",
+    "OEFAGuidedSamplerV2",
     "Focus",
     "GhostBottleneck",
     "GhostConv",

@@ -15,7 +15,7 @@ from ultralytics.utils import NOT_MACOS14
 from ultralytics.utils.tal import dist2bbox, dist2rbox, make_anchors
 from ultralytics.utils.torch_utils import TORCH_1_11, fuse_conv_and_bn, smart_inference_mode
 
-from .block import DFL, SAVPE, BNContrastiveHead, ContrastiveHead, Proto, Proto26, RealNVP, Residual, SwiGLUFFN
+from .block import DFL, SAVPE, BNContrastiveHead, ContrastiveHead, Proto, Proto26, RealNVP, Residual, SwiGLUFFN, AdaHGComputation
 from .conv import Conv, DWConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
@@ -31,6 +31,7 @@ __all__ = (
     "YOLOEDetect",
     "YOLOESegment",
     "v10Detect",
+    "HGALDetect",
 )
 
 
@@ -1866,3 +1867,272 @@ class SemanticSegment(nn.Module):
         if self.export and self.format != "coreml":  # coreml does not support interpolate
             return F.interpolate(logits, scale_factor=8, mode="bilinear", align_corners=False)
         return logits
+
+class HGALDetect(Detect):
+    def __init__(
+        self,
+        nc=80,
+        aux_index=1,
+        num_hyperedges=4,
+        num_heads=8,
+        dropout=0.0,
+        context="both",
+        aux_weight=0.25,
+        use_hypergraph=True,
+        reg_max=16,
+        end2end=False,
+        ch=(),
+    ):
+        if end2end:
+            raise ValueError(
+                "HGALDetect is designed for standard "
+                "one-to-many detection, not end2end mode."
+            )
+
+        if not ch:
+            raise ValueError(
+                "HGALDetect requires non-empty input channels."
+            )
+
+        if not 0 <= aux_index < len(ch):
+            raise ValueError(
+                f"aux_index={aux_index} is invalid for "
+                f"{len(ch)} feature levels."
+            )
+
+        super().__init__(
+            nc=nc,
+            reg_max=reg_max,
+            end2end=False,
+            ch=ch,
+        )
+
+        self.end2end = False
+        self.aux_index = int(aux_index)
+        self.num_hyperedges = int(num_hyperedges)
+        self.num_heads = int(num_heads)
+        self.aux_weight = float(aux_weight)
+        self.use_hypergraph = bool(use_hypergraph)
+        self.aux_removed = False
+
+        aux_ch = int(ch[self.aux_index])
+
+        if (
+            self.use_hypergraph
+            and aux_ch % self.num_heads != 0
+        ):
+            raise ValueError(
+                f"Auxiliary channels {aux_ch} must be divisible "
+                f"by num_heads={self.num_heads}."
+            )
+
+        self.aux_hyper = (
+            AdaHGComputation(
+                embed_dim=aux_ch,
+                num_hyperedges=self.num_hyperedges,
+                num_heads=self.num_heads,
+                dropout=dropout,
+                context=context,
+            )
+            if self.use_hypergraph
+            else nn.Identity()
+        )
+
+        # 后面的 aux_cv2 / aux_cv3 保持你现在的代码
+        # Auxiliary Detect-like head.
+        # Only one feature scale is used, so these lists have length 1.
+        aux_c2 = max(
+            16,
+            aux_ch // 4,
+            self.reg_max * 4,
+        )
+
+        aux_c3 = max(
+            aux_ch,
+            min(self.nc, 100),
+        )
+
+        self.aux_cv2 = nn.ModuleList(
+            [
+                nn.Sequential(
+                    Conv(aux_ch, aux_c2, 3),
+                    Conv(aux_c2, aux_c2, 3),
+                    nn.Conv2d(
+                        aux_c2,
+                        4 * self.reg_max,
+                        1,
+                    ),
+                )
+            ]
+        )
+
+        if self.legacy:
+            self.aux_cv3 = nn.ModuleList(
+                [
+                    nn.Sequential(
+                        Conv(aux_ch, aux_c3, 3),
+                        Conv(aux_c3, aux_c3, 3),
+                        nn.Conv2d(
+                            aux_c3,
+                            self.nc,
+                            1,
+                        ),
+                    )
+                ]
+            )
+        else:
+            self.aux_cv3 = nn.ModuleList(
+                [
+                    nn.Sequential(
+                        nn.Sequential(
+                            DWConv(aux_ch, aux_ch, 3),
+                            Conv(aux_ch, aux_c3, 1),
+                        ),
+                        nn.Sequential(
+                            DWConv(aux_c3, aux_c3, 3),
+                            Conv(aux_c3, aux_c3, 1),
+                        ),
+                        nn.Conv2d(
+                            aux_c3,
+                            self.nc,
+                            1,
+                        ),
+                    )
+                ]
+            )
+
+        # Auxiliary branch contains only one feature scale.
+        self.register_buffer(
+            "aux_stride",
+            torch.zeros(1),
+            persistent=True,
+        )
+
+    @property
+    def auxiliary(self):
+        """Return auxiliary box and classification heads."""
+        return {
+            "box_head": self.aux_cv2,
+            "cls_head": self.aux_cv3,
+        }
+
+    def forward_aux_head(
+        self,
+        x: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """
+        Run the single-scale auxiliary detection head.
+
+        The standard Detect.forward_head() cannot be used here,
+        because it loops over self.nl, which is 3 for P3/P4/P5,
+        while the auxiliary branch contains only one level.
+        """
+        bs = x.shape[0]
+
+        boxes = self.aux_cv2[0](x).view(
+            bs,
+            4 * self.reg_max,
+            -1,
+        )
+
+        scores = self.aux_cv3[0](x).view(
+            bs,
+            self.nc,
+            -1,
+        )
+
+        return {
+            "boxes": boxes,
+            "scores": scores,
+            "feats": [x],
+        }
+
+    def forward(
+        self,
+        x: list[torch.Tensor],
+    ):
+        """
+        Training:
+            return {
+                "boxes": ...,
+                "scores": ...,
+                "feats": ...,
+                "aux": {
+                    "boxes": ...,
+                    "scores": ...,
+                    "feats": ...
+                }
+            }
+
+        Validation/inference:
+            exactly the same output protocol as standard Detect.
+        """
+        # Standard YOLO P3/P4/P5 predictions.
+        preds = self.forward_head(
+            x,
+            **self.one2many,
+        )
+
+        if self.training:
+            aux_feature = x[self.aux_index]
+            aux_feature = self.aux_hyper(aux_feature)
+
+            preds["aux"] = self.forward_aux_head(
+                aux_feature
+            )
+
+            return preds
+
+        # Evaluation path remains identical to Detect.
+        y = self._inference(preds)
+
+        return y if self.export else (y, preds)
+
+    def bias_init(self):
+        """
+        Initialize both main and auxiliary detection biases.
+
+        DetectionModel computes the main strides before calling
+        this method, so the auxiliary stride can be copied from
+        the selected main feature level.
+        """
+        super().bias_init()
+
+        if self.stride.numel() <= self.aux_index:
+            raise RuntimeError(
+                "Main detection strides have not been initialized."
+            )
+
+        selected_stride = self.stride[
+            self.aux_index
+        ].detach()
+
+        self.aux_stride.copy_(
+            selected_stride.reshape(1)
+        )
+
+        stride_value = float(
+            self.aux_stride[0].item()
+        )
+
+        for box_head, cls_head in zip(
+            self.aux_cv2,
+            self.aux_cv3,
+        ):
+            box_head[-1].bias.data[:] = 2.0
+
+            cls_head[-1].bias.data[: self.nc] = math.log(
+                5
+                / self.nc
+                / (640 / stride_value) ** 2
+            )
+
+    def remove_auxiliary(self):
+        """
+        Permanently remove training-only auxiliary parameters
+        before deployment or final parameter counting.
+        """
+        self.aux_hyper = nn.Identity()
+        self.aux_cv2 = None
+        self.aux_cv3 = None
+        return self

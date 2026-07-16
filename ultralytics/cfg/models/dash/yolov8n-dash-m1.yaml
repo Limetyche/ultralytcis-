@@ -1,0 +1,37 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+# DASH-M1: Dual-Path Anchor Hypergraph with Dense Readout, YOLOv8n backbone and PAN.
+
+nc: 80
+scale: n
+detect_legacy: true
+scales:
+  n: [0.33, 0.25, 1024]
+
+backbone:
+  - [-1, 1, Conv, [64, 3, 2]]
+  - [-1, 1, Conv, [128, 3, 2]]
+  - [-1, 3, C2f, [128, true]]
+  - [-1, 1, Conv, [256, 3, 2]]
+  - [-1, 6, C2f, [256, true]]
+  - [-1, 1, Conv, [512, 3, 2]]
+  - [-1, 6, C2f, [512, true]]
+  - [-1, 1, Conv, [1024, 3, 2]]
+  - [-1, 3, C2f, [1024, true]]
+  - [-1, 1, SPPF, [1024, 5]]
+
+head:
+  - [-1, 1, nn.Upsample, [null, 2, nearest]]
+  - [[-1, 6], 1, Concat, [1]]
+  - [-1, 3, C2f, [512]]
+  - [-1, 1, nn.Upsample, [null, 2, nearest]]
+  - [[-1, 4], 1, Concat, [1]]
+  - [-1, 3, C2f, [256]]
+  - [-1, 1, Conv, [256, 3, 2]]
+  - [[-1, 12], 1, Concat, [1]]
+  - [-1, 3, C2f, [512]]
+  - [-1, 1, Conv, [512, 3, 2]]
+  - [[-1, 9], 1, Concat, [1]]
+  - [-1, 3, C2f, [1024]]
+  # nc, latent, semantic_edges, geometry_edges, grids, semantic, geometry,
+  # cross_scale, dense_readout, gamma_init, share_hypergraph, return_stats
+  - [[15, 18, 21], 1, DASHDetect, [nc, 48, 12, 8, [[12, 12], [8, 8], [4, 4]], true, true, true, true, 0.05, false, true]]

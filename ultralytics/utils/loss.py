@@ -480,6 +480,405 @@ class v8DetectionLoss:
         return loss * batch_size, loss_detach
 
 
+class OEFAM1DetectionLoss(v8DetectionLoss):
+    """Standard YOLO loss plus one scale-normalized soft weighted BCE evidence objective."""
+
+    def __init__(self, model: torch.nn.Module, positive_weight_cap: float = 20.0):
+        super().__init__(model)
+        from ultralytics.nn.modules.oefa import EvidenceTargetGenerator
+
+        self.head = model.model[-1]
+        self.target_generator = EvidenceTargetGenerator()
+        self.positive_weight_cap = float(positive_weight_cap)
+        self.loss_epoch = int(getattr(model, "loss_epoch", 0))
+        self.last_evidence_stats: dict[str, Any] = {}
+
+    def _channel_loss(self, logits: torch.Tensor, target: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        positive = target.sum().detach()
+        negative = (target.numel() - positive).clamp_min(0)
+        pos_weight = (negative / positive.clamp_min(1.0)).clamp(1.0, self.positive_weight_cap).detach()
+        loss = F.binary_cross_entropy_with_logits(logits, target, pos_weight=pos_weight)
+        return loss, (target > 0.1).float().mean().detach()
+
+    def __call__(self, preds, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+        preds = self.parse_output(preds)
+        det_total, det_items = self.loss(preds, batch)
+        evidence = preds.get("evidence")
+        if evidence is None:
+            return det_total, det_items
+        centers, boundaries, target_stats = self.target_generator(
+            batch["batch_idx"].long(),
+            batch["bboxes"],
+            preds["boxes"].shape[0],
+            [x.shape for x in evidence["center_logits"]],
+            batch["img"].shape[-2:],
+        )
+        center_losses, boundary_losses, center_ratios, boundary_ratios = [], [], [], []
+        if self.head.enable_center:
+            for logits, target in zip(evidence["center_logits"], centers):
+                loss, ratio = self._channel_loss(logits, target)
+                center_losses.append(loss)
+                center_ratios.append(float(ratio))
+        if self.head.enable_boundary:
+            for logits, target in zip(evidence["boundary_logits"], boundaries):
+                loss, ratio = self._channel_loss(logits, target)
+                boundary_losses.append(loss)
+                boundary_ratios.append(float(ratio))
+        zero = preds["boxes"].sum() * 0.0
+        center_loss = torch.stack(center_losses).mean() if center_losses else zero
+        boundary_loss = torch.stack(boundary_losses).mean() if boundary_losses else zero
+        active_channels = int(bool(center_losses)) + int(bool(boundary_losses))
+        evidence_loss = (center_loss + boundary_loss) / max(active_channels, 1)
+        warmup = min(max((self.loss_epoch + 1) / 3.0, 0.0), 1.0)
+        weighted = evidence_loss * (self.head.lambda_evidence * warmup)
+        self.last_evidence_stats = {
+            "evidence/center_loss": float(center_loss.detach()),
+            "evidence/boundary_loss": float(boundary_loss.detach()),
+            "evidence/total_loss": float(weighted.detach()),
+            "evidence/warmup": warmup,
+            "evidence/center_positive_ratio": center_ratios,
+            "evidence/boundary_positive_ratio": boundary_ratios,
+            "evidence/target_stats": target_stats,
+        }
+        return det_total.sum() + weighted * preds["boxes"].shape[0], det_items
+
+
+class OEFAM1V2DetectionLoss(v8DetectionLoss):
+    """Detection plus V2 evidence loss; Detect itself remains completely native."""
+
+    def __init__(self, model: torch.nn.Module, positive_weight_cap: float = 20.0):
+        super().__init__(model)
+        from ultralytics.nn.modules.oefa_v2 import EvidenceTargetGeneratorV2
+
+        self.lambda_evidence = float(model.yaml.get("oefa_lambda_evidence", 0.25))
+        self.enable_center = bool(model.yaml.get("oefa_enable_center", True))
+        self.enable_boundary = bool(model.yaml.get("oefa_enable_boundary", True))
+        self.debug_stats = bool(model.yaml.get("oefa_debug_stats", False))
+        self.positive_weight_cap = float(positive_weight_cap)
+        self.target_generator = EvidenceTargetGeneratorV2(chunk_size=int(model.yaml.get("oefa_target_chunk", 32)))
+        self.loss_epoch = int(getattr(model, "loss_epoch", 0))
+        self.last_evidence_stats = {}
+
+    def _channel_loss(self, logits, target):
+        positive = target.sum().detach()
+        pos_weight = ((target.numel() - positive) / positive.clamp_min(1.0)).clamp(1.0, self.positive_weight_cap)
+        return F.binary_cross_entropy_with_logits(logits, target, pos_weight=pos_weight.detach())
+
+    def __call__(self, preds, batch):
+        preds = self.parse_output(preds)
+        det_total, det_items = self.loss(preds, batch)
+        evidence = preds["evidence"]
+        centers, boundaries = self.target_generator(batch["batch_idx"].long(), batch["bboxes"],
+            preds["boxes"].shape[0], [z.shape for z in evidence["center_logits"]], batch["img"].shape[-2:])
+        losses = []
+        if self.enable_center:
+            losses.extend(self._channel_loss(x, y) for x, y in zip(evidence["center_logits"], centers))
+        if self.enable_boundary:
+            losses.extend(self._channel_loss(x, y) for x, y in zip(evidence["boundary_logits"], boundaries))
+        evidence_loss = torch.stack(losses).mean() if losses else preds["boxes"].sum() * 0.0
+        warmup = min(max((self.loss_epoch + 1) / 3.0, 0.0), 1.0)
+        weighted = evidence_loss * (self.lambda_evidence * warmup)
+        if self.debug_stats:
+            self.last_evidence_stats = {"evidence/total_loss": float(weighted.detach()), "evidence/warmup": warmup}
+        return det_total.sum() + weighted * preds["boxes"].shape[0], det_items
+
+
+class DASHM2LiteDetectionLoss(v8DetectionLoss):
+    """Standard YOLO detection loss plus two warm-started, assignment-supervised incidence affinities."""
+
+    def __init__(self, model: torch.nn.Module, semantic_weight: float = 0.05, geometry_weight: float = 0.05):
+        super().__init__(model)
+        self.loss_epoch = int(getattr(model, "loss_epoch", 0))
+        self.semantic_weight = float(semantic_weight)
+        self.geometry_weight = float(geometry_weight)
+        self.last_relation_stats: dict[str, float] = {}
+
+    @staticmethod
+    def _anchor_indices(feats: list[torch.Tensor], grids: list[tuple[int, int]], device: torch.device) -> torch.Tensor:
+        """Map each pooled anchor-token centre to its nearest dense prediction cell."""
+        indices, offset = [], 0
+        for feat, (gh, gw) in zip(feats, grids):
+            h, w = feat.shape[-2:]
+            iy = torch.floor((torch.arange(gh, device=device).float() + 0.5) * h / gh).long().clamp_max(h - 1)
+            ix = torch.floor((torch.arange(gw, device=device).float() + 0.5) * w / gw).long().clamp_max(w - 1)
+            yy, xx = torch.meshgrid(iy, ix, indexing="ij")
+            indices.append(offset + (yy * w + xx).reshape(-1))
+            offset += h * w
+        return torch.cat(indices)
+
+    @staticmethod
+    def _sampled_affinity_loss(
+        incidence: torch.Tensor,
+        foreground: torch.Tensor,
+        group: torch.Tensor,
+        include_background: bool,
+    ) -> torch.Tensor:
+        """Contrast incidence-induced affinity using positives and a bounded set of hard relation negatives."""
+        a = F.normalize(incidence.float(), p=2, dim=-1, eps=1e-6)
+        similarity = torch.bmm(a, a.transpose(1, 2)).clamp(1e-5, 1 - 1e-5)
+        eye = torch.eye(a.shape[1], device=a.device, dtype=torch.bool).unsqueeze(0)
+        both_fg = foreground.unsqueeze(2) & foreground.unsqueeze(1)
+        same = group.unsqueeze(2).eq(group.unsqueeze(1))
+        positive = both_fg & same & ~eye
+        negative = both_fg & ~same
+        if include_background:
+            one_background = foreground.unsqueeze(2) ^ foreground.unsqueeze(1)
+            negative |= one_background
+
+        losses = []
+        for b in range(a.shape[0]):
+            pos_values = similarity[b][positive[b]]
+            neg_values = similarity[b][negative[b]]
+            if not pos_values.numel():
+                continue
+            # Bound negatives to prevent the background relation count from dominating.
+            max_neg = max(int(pos_values.numel() * 4), 32)
+            if neg_values.numel() > max_neg:
+                hardness = neg_values.detach().topk(max_neg).indices
+                neg_values = neg_values[hardness]
+            sample_loss = F.binary_cross_entropy(pos_values, torch.ones_like(pos_values))
+            if neg_values.numel():
+                sample_loss = sample_loss + F.binary_cross_entropy(neg_values, torch.zeros_like(neg_values))
+            losses.append(sample_loss)
+        return torch.stack(losses).mean() if losses else incidence.sum() * 0.0
+
+    def __call__(self, preds, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+        preds = self.parse_output(preds)
+        batch_size = preds["boxes"].shape[0]
+        assigned, det_loss, det_items = self.get_assigned_targets_and_loss(preds, batch)
+        fg_mask, target_gt_idx = assigned[:2]
+        routing = preds["dash_routing"]
+        anchor_idx = self._anchor_indices(preds["feats"], routing["anchor_grid_sizes"], self.device)
+
+        imgsz = torch.tensor(preds["feats"][0].shape[2:], device=self.device, dtype=preds["boxes"].dtype)
+        imgsz = imgsz * self.stride[0]
+        targets = torch.cat((batch["batch_idx"].view(-1, 1), batch["cls"].view(-1, 1), batch["bboxes"]), 1)
+        targets = self.preprocess(targets.to(self.device), batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
+        gt_labels = targets[..., 0].long()
+        safe_gt_idx = target_gt_idx.clamp_max(max(gt_labels.shape[1] - 1, 0))
+        assigned_class = gt_labels.gather(1, safe_gt_idx) if gt_labels.shape[1] else torch.zeros_like(target_gt_idx)
+
+        anchor_fg = fg_mask[:, anchor_idx]
+        anchor_cls = assigned_class[:, anchor_idx]
+        anchor_gt = target_gt_idx[:, anchor_idx]
+        semantic_raw = self._sampled_affinity_loss(
+            routing["cls_incidence"], anchor_fg, anchor_cls, include_background=True
+        )
+        geometry_raw = self._sampled_affinity_loss(
+            routing["reg_incidence"], anchor_fg, anchor_gt, include_background=False
+        )
+
+        epoch = self.loss_epoch
+        warm = 0.0 if epoch < 3 else min((epoch - 2) / 12.0, 1.0)
+        semantic_weighted = semantic_raw * (self.semantic_weight * warm)
+        geometry_weighted = geometry_raw * (self.geometry_weight * warm)
+        relation = semantic_weighted + geometry_weighted
+        self.last_relation_stats = {
+            "semantic_raw": float(semantic_raw.detach()),
+            "geometry_raw": float(geometry_raw.detach()),
+            "semantic_weighted": float(semantic_weighted.detach()),
+            "geometry_weighted": float(geometry_weighted.detach()),
+            "warmup": warm,
+        }
+        if routing["cls_incidence"].requires_grad:
+            routing["cls_incidence"].register_hook(
+                lambda grad: self.last_relation_stats.__setitem__("semantic_incidence_grad_norm", float(grad.norm()))
+            )
+        if routing["reg_incidence"].requires_grad:
+            routing["reg_incidence"].register_hook(
+                lambda grad: self.last_relation_stats.__setitem__("geometry_incidence_grad_norm", float(grad.norm()))
+            )
+        # Keep the public three-item YOLO loss protocol unchanged; relation diagnostics live above.
+        return (det_loss.sum() + relation) * batch_size, det_items
+
+
+class HGALDetectionLoss:
+    """
+    Main YOLO detection loss plus weighted HGAL auxiliary loss.
+
+    Main head:
+        P3/P4/P5, strides [8, 16, 32]
+
+    Auxiliary head:
+        P4 only, stride [16]
+
+    Auxiliary loss ratio:
+        box : cls : dfl = 0.2 : 0.6 : 0.2
+
+    For example, when aux_weight=0.25:
+        box gain = 0.05
+        cls gain = 0.15
+        dfl gain = 0.05
+    """
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        tal_topk: int = 10,
+    ):
+        head = model.model[-1]
+
+        if not hasattr(head, "aux_weight"):
+            raise TypeError(
+                "HGALDetectionLoss requires an HGALDetect head."
+            )
+
+        self.device = next(model.parameters()).device
+        self.aux_weight = float(head.aux_weight)
+
+        # Auxiliary relative ratios: [box, cls, dfl].
+        # The final gains are controlled by aux_weight in YAML.
+        self.aux_ratio = torch.tensor(
+            [0.2, 0.6, 0.2],
+            device=self.device,
+            dtype=torch.float32,
+        )
+
+        # Main P3/P4/P5 detection loss.
+        self.main_loss = v8DetectionLoss(
+            model,
+            tal_topk=tal_topk,
+        )
+
+        # Create another standard detection loss for the
+        # single-scale P4 auxiliary prediction.
+        self.aux_loss = v8DetectionLoss(
+            model,
+            tal_topk=tal_topk,
+        )
+
+        # HGALDetect.bias_init() initializes this from the
+        # selected main feature level, normally tensor([16.]).
+        aux_stride = (
+            head.aux_stride
+            .detach()
+            .clone()
+            .to(
+                device=self.aux_loss.device,
+                dtype=torch.float32,
+            )
+        )
+
+        if aux_stride.numel() != 1:
+            raise ValueError(
+                "Current HGAL auxiliary head must contain "
+                "exactly one feature scale, but got "
+                f"aux_stride={aux_stride.tolist()}."
+            )
+
+        if float(aux_stride[0].item()) <= 0:
+            raise ValueError(
+                "HGAL auxiliary stride has not been initialized: "
+                f"{aux_stride.tolist()}."
+            )
+
+        # make_anchors() inside v8DetectionLoss uses this stride.
+        self.aux_loss.stride = aux_stride
+
+        # v8DetectionLoss created its assigner using the main
+        # strides [8, 16, 32]. Rebuild it for auxiliary P4 only.
+        self.aux_loss.assigner = TaskAlignedAssigner(
+            topk=tal_topk,
+            num_classes=self.aux_loss.nc,
+            alpha=0.5,
+            beta=6.0,
+            stride=aux_stride.tolist(),
+            topk2=None,
+        )
+
+        self._printed = False
+
+    def __call__(
+        self,
+        preds,
+        batch: dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Training:
+            main loss + weighted auxiliary loss
+
+        Validation:
+            main loss only, because HGALDetect does not execute
+            the auxiliary branch in eval mode.
+        """
+        preds = self.main_loss.parse_output(preds)
+
+        if not isinstance(preds, dict):
+            raise TypeError(
+                "HGALDetectionLoss expects prediction dict, "
+                f"but got {type(preds).__name__}."
+            )
+
+        main_preds = {
+            "boxes": preds["boxes"],
+            "scores": preds["scores"],
+            "feats": preds["feats"],
+        }
+
+        # Validation/evaluation path:
+        # HGALDetect returns only main predictions in eval mode.
+        if "aux" not in preds:
+            return self.main_loss.loss(
+                main_preds,
+                batch,
+            )
+
+        # Training path.
+        aux_preds = preds["aux"]
+
+        main_total, main_items = self.main_loss.loss(
+            main_preds,
+            batch,
+        )
+
+        aux_total, aux_items = self.aux_loss.loss(
+            aux_preds,
+            batch,
+        )
+
+        # Match AMP dtype/device dynamically.
+        aux_gain = (
+            self.aux_ratio.to(
+                device=aux_total.device,
+                dtype=aux_total.dtype,
+            )
+            * self.aux_weight
+        )
+
+        # main_total and aux_total are both:
+        # tensor([box_loss, cls_loss, dfl_loss])
+        weighted_aux_total = aux_total * aux_gain
+
+        weighted_aux_items = (
+            aux_items
+            * aux_gain.to(
+                device=aux_items.device,
+                dtype=aux_items.dtype,
+            )
+        )
+
+        total = main_total + weighted_aux_total
+        loss_items = main_items + weighted_aux_items
+
+        # Print only once to confirm that the auxiliary loss
+        # is active and using the correct stride/gains.
+        if not self._printed:
+            print(
+                "\nHGALDetectionLoss active"
+                f"\n  main stride: {self.main_loss.stride.tolist()}"
+                f"\n  aux stride:  {self.aux_loss.stride.tolist()}"
+                f"\n  aux weight:  {self.aux_weight}"
+                f"\n  aux gains:   "
+                f"{aux_gain.detach().float().cpu().tolist()}"
+                f"\n  main loss:   "
+                f"{main_items.detach().float().cpu().tolist()}"
+                f"\n  aux loss:    "
+                f"{aux_items.detach().float().cpu().tolist()}"
+            )
+            self._printed = True
+
+        return total, loss_items
+
 class v8SegmentationLoss(v8DetectionLoss):
     """Criterion class for computing training losses for YOLOv8 segmentation."""
 

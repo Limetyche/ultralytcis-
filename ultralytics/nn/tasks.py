@@ -73,6 +73,25 @@ from ultralytics.nn.modules import (
     YOLOESegment,
     YOLOESegment26,
     v10Detect,
+    MASDown,
+    MASSRUp,
+    DSConv,
+    HyperACE,
+    AdaHGComputation,
+    DownsampleConv,
+    FullPAD_Tunnel,
+    DSC3k2,
+    HGD_Tunnel,
+    HGALDetect,
+    CSHIA,
+    DASHDetect,
+    DASHDetectEfficient,
+    DASHDetectM2Lite,
+    DARTDetect,
+    OEFAM1Detect,
+    OEFABoundaryDownsampleV2,
+    OEFAEvidencePredictorV2,
+    OEFAGuidedSamplerV2,
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, LOGGER, SETTINGS, WINDOWS, YAML, colorstr, emojis
 from ultralytics.utils.checks import REMOTE_FILE_PREFIXES, check_file, check_requirements, check_suffix, check_yaml
@@ -82,6 +101,10 @@ from ultralytics.utils.loss import (
     SemanticSegmentationLoss,
     v8ClassificationLoss,
     v8DetectionLoss,
+    HGALDetectionLoss,
+    DASHM2LiteDetectionLoss,
+    OEFAM1DetectionLoss,
+    OEFAM1V2DetectionLoss,
     v8OBBLoss,
     v8PoseLoss,
     v8SegmentationLoss,
@@ -188,6 +211,9 @@ class BaseModel(torch.nn.Module):
                 embeddings.append(torch.nn.functional.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1))  # flatten
                 if m.i == max_idx:
                     return torch.unbind(torch.cat(embeddings, 1), dim=0)
+        evidence_layer = getattr(self, "oefa_evidence_layer", None)
+        if self.training and evidence_layer is not None and isinstance(x, dict):
+            x["evidence"] = y[evidence_layer]
         return x
 
     def _predict_augment(self, x):
@@ -358,6 +384,7 @@ def _initialize_yolo_model(model, cfg, ch, nc, verbose):
     model.model, model.save = parse_model(deepcopy(model.yaml), ch=ch, verbose=verbose)  # model, savelist
     model.names = {i: f"{i}" for i in range(model.yaml["nc"])}  # default names dict
     model.inplace = model.yaml.get("inplace", True)
+    model.oefa_evidence_layer = model.yaml.get("oefa_evidence_layer")
 
 
 class DetectionModel(BaseModel):
@@ -515,10 +542,25 @@ class DetectionModel(BaseModel):
         y[-1] = y[-1][..., i:]  # small
         return y
 
+    # def init_criterion(self):
+    #     """Initialize the loss criterion for the DetectionModel."""
+    #     return E2ELoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
     def init_criterion(self):
         """Initialize the loss criterion for the DetectionModel."""
-        return E2ELoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
+        if isinstance(self.model[-1], HGALDetect):
+            return HGALDetectionLoss(self)
+        if isinstance(self.model[-1], DASHDetectM2Lite):
+            return DASHM2LiteDetectionLoss(self)
+        if isinstance(self.model[-1], OEFAM1Detect) and self.model[-1].has_evidence:
+            return OEFAM1DetectionLoss(self)
+        if getattr(self, "oefa_evidence_layer", None) is not None:
+            return OEFAM1V2DetectionLoss(self)
 
+        return (
+            E2ELoss(self)
+            if getattr(self, "end2end", False)
+            else v8DetectionLoss(self)
+        )
 
 class OBBModel(DetectionModel):
     """YOLO Oriented Bounding Box (OBB) model.
@@ -1708,6 +1750,9 @@ def parse_model(d, ch, verbose=True):
             SCDown,
             C2fCIB,
             A2C2f,
+            MASDown,
+            DSC3k2,
+            DSConv,
         }
     )
     repeat_modules = frozenset(  # modules with 'repeat' arguments
@@ -1727,6 +1772,7 @@ def parse_model(d, ch, verbose=True):
             C2fCIB,
             C2PSA,
             A2C2f,
+            DSC3k2,
         }
     )
     for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args
@@ -1742,7 +1788,11 @@ def parse_model(d, ch, verbose=True):
                 with contextlib.suppress(ValueError):
                     args[j] = locals()[a] if a in locals() else ast.literal_eval(a)
         n = n_ = max(round(n * depth), 1) if n > 1 else n  # depth gain
-        if m in base_modules:
+        if m is MASSRUp:
+          c1 = ch[f]
+          c2 = c1
+          args = [c1, *args]
+        elif m in base_modules:
             c1, c2 = ch[f], args[0]
             if c2 != nc:  # if c2 != nc (e.g., Classify() output)
                 c2 = make_divisible(min(c2, max_channels) * width, 8)
@@ -1754,7 +1804,7 @@ def parse_model(d, ch, verbose=True):
             if m in repeat_modules:
                 args.insert(2, n)  # number of repeats
                 n = 1
-            if m is C3k2:  # for M/L/X sizes
+            if m in {C3k2, DSC3k2}:  # for M/L/X sizes
                 legacy = False
                 if scale in "mlx":
                     args[3] = True
@@ -1764,8 +1814,55 @@ def parse_model(d, ch, verbose=True):
                     args.extend((True, 1.2))
             if m is C2fCIB:
                 legacy = False
+        elif m is HyperACE:
+            legacy = False
+            c1 = ch[f[1]]
+            c2 = args[0]
+            c2 = make_divisible(min(c2, max_channels) * width, 8)
+            he = args[1]
+            if scale in "n":
+                he = int(args[1] * 0.5)
+            elif scale in "x":
+                he = int(args[1] * 1.5)
+            args = [c1, c2, n, he, *args[2:]]
+            n = 1
+            if scale in "lx":
+                args.append(False)
+
+        elif m is DownsampleConv:
+            c1 = ch[f]
+            c2 = c1 * 2
+            args = [c1]
+            if scale in "lx":
+                args.append(False)
+                c2 = c1
+        elif m is FullPAD_Tunnel:
+            c2 = ch[f[0]]
+        elif m is HGD_Tunnel:
+            c2 = ch[f[0]]
+            args = [c2, *args]
         elif m is AIFI:
-            args = [ch[f], *args]
+          args = [ch[f], *args]
+        elif m is CSHIA:
+            # 实际输入通道，例如 YOLOv8n 下是 [64, 128, 256]
+            input_channels = [ch[x] for x in f]
+
+            # YAML 中声明的基础输出通道，例如 512
+            c2 = args[0]
+
+            # 必须和 Ultralytics 其他模块一样应用 width multiplier
+            c2 = make_divisible(
+                min(c2, max_channels) * width,
+                8,
+            )
+
+            # CSHIA(channels, c_out, num_hyperedges, num_heads, ...)
+            args = [
+                input_channels,
+                c2,
+                *args[1:],
+            ]
+
         elif m in frozenset({HGStem, HGBlock}):
             c1, cm, c2 = ch[f], args[0], args[1]
             args = [c1, cm, c2, *args[2:]]
@@ -1778,9 +1875,24 @@ def parse_model(d, ch, verbose=True):
             args = [ch[f]]
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
+        elif m is OEFAEvidencePredictorV2:
+            args = [[ch[x] for x in f], *args]
+            c2 = 0  # Bundle node; consumers have dedicated parse rules below.
+        elif m is OEFAGuidedSamplerV2:
+            args = [ch[f[0]], ch[f[1]], *args]
+            c2 = ch[f[0]]
+        elif m is OEFABoundaryDownsampleV2:
+            args = [ch[f[0]], *args]
+            c2 = ch[f[0]]
         elif m in frozenset(
             {
                 Detect,
+                HGALDetect,
+                DASHDetect,
+                DASHDetectEfficient,
+                DASHDetectM2Lite,
+                DARTDetect,
+                OEFAM1Detect,
                 WorldDetect,
                 YOLOEDetect,
                 Segment,
@@ -1797,7 +1909,13 @@ def parse_model(d, ch, verbose=True):
             if m is Segment or m is YOLOESegment or m is Segment26 or m is YOLOESegment26:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
             if m in {Detect, YOLOEDetect, Segment, Segment26, YOLOESegment, YOLOESegment26, Pose, Pose26, OBB, OBB26}:
-                m.legacy = legacy
+                m.legacy = d.get("detect_legacy", legacy)
+            if m in {DASHDetect, DASHDetectEfficient, DASHDetectM2Lite}:
+                m.legacy = d.get("detect_legacy", legacy)
+            if m is DARTDetect:
+                m.legacy = d.get("detect_legacy", legacy)
+            if m is OEFAM1Detect:
+                m.legacy = d.get("detect_legacy", legacy)
         elif m is SemanticSegment:
             args.append([ch[x] for x in f])  # nc, ch tuple
         elif m is v10Detect:

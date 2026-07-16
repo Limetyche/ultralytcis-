@@ -400,6 +400,11 @@ class BaseTrainer:
         self._oom_retries = 0  # OOM auto-reduce counter for first epoch
         while True:
             self.epoch = epoch
+            # Optional epoch-aware auxiliary criteria (no effect on standard YOLO losses).
+            train_model = unwrap_model(self.model)
+            train_model.loss_epoch = epoch
+            if hasattr(getattr(train_model, "criterion", None), "loss_epoch"):
+                train_model.criterion.loss_epoch = epoch
             self.run_callbacks("on_train_epoch_start")
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")  # suppress 'Detected lr_scheduler.step() before optimizer.step()'

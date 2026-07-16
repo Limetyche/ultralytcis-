@@ -149,6 +149,7 @@ dmypy.json
 
 # datasets and projects (ignore /datasets dir at root only to allow for docs/en/datasets dir)
 /datasets
+datasets/
 runs/
 wandb/
 .DS_Store
@@ -157,6 +158,7 @@ wandb/
 weights/
 *.weights
 *.pt
+*.pth
 *.ts
 *.pb
 *.onnx
@@ -181,6 +183,18 @@ pnnx*
 
 # calibration image
 calibration_*.npy
+*.npy
+*.cache
+
+# OEFA profiler and local profiling outputs
+oefa_profiles/
+*.prof
+*.trace
+
+# Editor and ad-hoc backup files
+*.bak
+*.bak_*
+*.tmp
 
 # Videos and Pictures
 *.mp4

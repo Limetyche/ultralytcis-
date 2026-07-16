@@ -1,0 +1,39 @@
+# Modular OEFA-M1 V2: backbone -> explicit independent OEFA neck nodes -> native Detect.
+nc: 80
+scale: n
+detect_legacy: false
+oefa_evidence_layer: 11
+oefa_lambda_evidence: 0.25
+oefa_enable_center: true
+oefa_enable_boundary: true
+oefa_debug_stats: false
+oefa_target_chunk: 32
+scales:
+  n: [0.50, 0.25, 1024]
+backbone:
+  - [-1, 1, Conv, [64, 3, 2]]
+  - [-1, 1, Conv, [128, 3, 2]]
+  - [-1, 2, C3k2, [256, false, 0.25]]
+  - [-1, 1, Conv, [256, 3, 2]]
+  - [-1, 2, C3k2, [512, false, 0.25]]
+  - [-1, 1, Conv, [512, 3, 2]]
+  - [-1, 2, C3k2, [512, true]]
+  - [-1, 1, Conv, [1024, 3, 2]]
+  - [-1, 2, C3k2, [1024, true]]
+  - [-1, 1, SPPF, [1024, 5]]
+  - [-1, 2, C2PSA, [1024]]
+head:
+  - [[4, 6, 10], 1, OEFAEvidencePredictorV2, [24, true, false]]
+  - [[10, 6, 11], 1, OEFAGuidedSamplerV2, [1, 4, 1.0, false, false]]
+  - [[-1, 6], 1, Concat, [1]]
+  - [-1, 2, C3k2, [512, false]]
+  - [[14, 4, 11], 1, OEFAGuidedSamplerV2, [0, 4, 1.5, false, false]]
+  - [[-1, 4], 1, Concat, [1]]
+  - [-1, 2, C3k2, [256, false]]
+  - [[17, 11], 1, OEFABoundaryDownsampleV2, [0, true, 0.25, false]]
+  - [[-1, 14], 1, Concat, [1]]
+  - [-1, 2, C3k2, [512, false]]
+  - [[20, 11], 1, OEFABoundaryDownsampleV2, [1, true, 0.25, false]]
+  - [[-1, 10], 1, Concat, [1]]
+  - [-1, 2, C3k2, [1024, true]]
+  - [[17, 20, 23], 1, Detect, [nc]]
