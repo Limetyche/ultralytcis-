@@ -17,8 +17,8 @@ __all__ = (
     "BoundaryPreservingDownsample",
     "EvidenceGuidedSampler",
     "EvidenceTargetGenerator",
-    "ObjectEvidencePredictor",
     "OEFAM1Detect",
+    "ObjectEvidencePredictor",
 )
 
 
@@ -147,7 +147,9 @@ class BoundaryPreservingDownsample(nn.Module):
             "gate_mean": float(gate.detach().mean()),
             "gate_std": float(gate.detach().std(unbiased=False)),
             "alpha": float(self.alpha.detach()),
-            "residual_base_ratio": float((self.alpha * gate * geometry).detach().abs().mean() / base.detach().abs().mean().clamp_min(1e-9)),
+            "residual_base_ratio": float(
+                (self.alpha * gate * geometry).detach().abs().mean() / base.detach().abs().mean().clamp_min(1e-9)
+            ),
         }
         return base + self.alpha * gate * geometry
 

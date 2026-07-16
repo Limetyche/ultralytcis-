@@ -13,10 +13,10 @@ import torch.nn.functional as F
 from .conv import Conv
 
 __all__ = (
+    "EvidenceTargetGeneratorV2",
+    "OEFABoundaryDownsampleV2",
     "OEFAEvidencePredictorV2",
     "OEFAGuidedSamplerV2",
-    "OEFABoundaryDownsampleV2",
-    "EvidenceTargetGeneratorV2",
 )
 
 
@@ -50,10 +50,15 @@ class OEFAEvidencePredictorV2(nn.Module):
         super().__init__()
         self.shared, self.debug_stats = bool(shared), bool(debug_stats)
         self.projections = nn.ModuleList(nn.Conv2d(c, evidence_dim, 1, bias=False) for c in channels)
-        make_tower = lambda: nn.Sequential(
-            nn.Conv2d(evidence_dim, evidence_dim, 3, 1, 1, groups=evidence_dim, bias=False),
-            nn.BatchNorm2d(evidence_dim), nn.SiLU(inplace=True), nn.Conv2d(evidence_dim, 2, 1)
-        )
+
+        def make_tower():
+            return nn.Sequential(
+                nn.Conv2d(evidence_dim, evidence_dim, 3, 1, 1, groups=evidence_dim, bias=False),
+                nn.BatchNorm2d(evidence_dim),
+                nn.SiLU(inplace=True),
+                nn.Conv2d(evidence_dim, 2, 1),
+            )
+
         self.predictor = make_tower() if self.shared else nn.ModuleList(make_tower() for _ in channels)
 
     def forward(self, features: list[torch.Tensor]) -> dict[str, list[torch.Tensor]]:
@@ -67,11 +72,23 @@ class OEFAEvidencePredictorV2(nn.Module):
 class OEFAGuidedSamplerV2(nn.Module):
     """Mathematically equivalent K-point residual sampler with cached normalized grids."""
 
-    def __init__(self, source_channels: int, lateral_channels: int, evidence_level: int, k: int = 4,
-                 max_range: float = 1.5, detach_evidence: bool = False, debug_stats: bool = False):
+    def __init__(
+        self,
+        source_channels: int,
+        lateral_channels: int,
+        evidence_level: int,
+        k: int = 4,
+        max_range: float = 1.5,
+        detach_evidence: bool = False,
+        debug_stats: bool = False,
+    ):
         super().__init__()
         self.evidence_level, self.k = int(evidence_level), int(k)
-        self.max_range, self.detach_evidence, self.debug_stats = float(max_range), bool(detach_evidence), bool(debug_stats)
+        self.max_range, self.detach_evidence, self.debug_stats = (
+            float(max_range),
+            bool(detach_evidence),
+            bool(debug_stats),
+        )
         self.offset_mixer = nn.Conv2d(source_channels + lateral_channels + 1, 3 * self.k, 1)
         nn.init.zeros_(self.offset_mixer.weight)
         nn.init.zeros_(self.offset_mixer.bias)
@@ -97,25 +114,44 @@ class OEFAGuidedSamplerV2(nn.Module):
         sampled = sampled.view(b, baseline.shape[1], h, w, self.k).permute(0, 4, 1, 2, 3)
         dynamic = torch.sum(sampled * weight.unsqueeze(2), dim=1)
         if self.debug_stats:
-            self.last_stats = {"offset_mean": float(offset.detach().abs().mean()), "offset_max": float(offset.detach().abs().max())}
+            self.last_stats = {
+                "offset_mean": float(offset.detach().abs().mean()),
+                "offset_max": float(offset.detach().abs().max()),
+            }
         return baseline + self.alpha * (dynamic - baseline)
 
 
 class OEFABoundaryDownsampleV2(nn.Module):
     """Boundary-preserving stride-2 branch, independent of the detector."""
 
-    def __init__(self, channels: int, evidence_level: int, use_center: bool = True,
-                 geometry_ratio: float = 0.25, debug_stats: bool = False):
+    def __init__(
+        self,
+        channels: int,
+        evidence_level: int,
+        use_center: bool = True,
+        geometry_ratio: float = 0.25,
+        debug_stats: bool = False,
+    ):
         super().__init__()
-        self.evidence_level, self.use_center, self.debug_stats = int(evidence_level), bool(use_center), bool(debug_stats)
+        self.evidence_level, self.use_center, self.debug_stats = (
+            int(evidence_level),
+            bool(use_center),
+            bool(debug_stats),
+        )
         self.base = Conv(channels, channels, 3, 2)
         hidden = max(8, int(channels * geometry_ratio))
         self.geometry_projection = nn.Conv2d(channels, hidden, 1, bias=False)
-        self.geometry = nn.Sequential(nn.Conv2d(hidden, hidden, 3, 2, 1, groups=hidden, bias=False),
-                                      nn.BatchNorm2d(hidden), nn.SiLU(inplace=True), nn.Conv2d(hidden, channels, 1))
-        nn.init.zeros_(self.geometry[-1].weight); nn.init.zeros_(self.geometry[-1].bias)
+        self.geometry = nn.Sequential(
+            nn.Conv2d(hidden, hidden, 3, 2, 1, groups=hidden, bias=False),
+            nn.BatchNorm2d(hidden),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(hidden, channels, 1),
+        )
+        nn.init.zeros_(self.geometry[-1].weight)
+        nn.init.zeros_(self.geometry[-1].bias)
         self.gate = nn.Conv2d(2 if self.use_center else 1, 1, 1)
-        nn.init.zeros_(self.gate.weight); nn.init.zeros_(self.gate.bias)
+        nn.init.zeros_(self.gate.weight)
+        nn.init.zeros_(self.gate.bias)
         self.alpha = nn.Parameter(torch.tensor(0.1))
         self.last_stats: dict[str, float] = {}
 
@@ -130,15 +166,26 @@ class OEFABoundaryDownsampleV2(nn.Module):
         gate = self.gate(torch.cat(gate_inputs, 1)).sigmoid()
         base = self.base(x)
         if self.debug_stats:
-            self.last_stats = {"gate_mean": float(gate.detach().mean()), "gate_std": float(gate.detach().std(unbiased=False))}
+            self.last_stats = {
+                "gate_mean": float(gate.detach().mean()),
+                "gate_std": float(gate.detach().std(unbiased=False)),
+            }
         return base + self.alpha * gate * geometry
 
 
 class EvidenceTargetGeneratorV2(nn.Module):
     """Chunked GPU-vectorized target generator preserving per-image maximum overlap semantics."""
 
-    def __init__(self, canonical_scales=(32.0, 96.0, 224.0), tau=1.0, center_sigma_ratio=0.25,
-                 boundary_sigma=1.5, min_sigma=1.0, boundary_expand=0.1, chunk_size=32):
+    def __init__(
+        self,
+        canonical_scales=(32.0, 96.0, 224.0),
+        tau=1.0,
+        center_sigma_ratio=0.25,
+        boundary_sigma=1.5,
+        min_sigma=1.0,
+        boundary_expand=0.1,
+        chunk_size=32,
+    ):
         super().__init__()
         self.canonical_scales = tuple(float(x) for x in canonical_scales)
         self.tau, self.center_sigma_ratio = float(tau), float(center_sigma_ratio)
@@ -157,21 +204,43 @@ class EvidenceTargetGeneratorV2(nn.Module):
         centers, boundaries = [], []
         for level, shape in enumerate(feature_shapes):
             h, w = shape[-2], shape[-1]
-            center = boxes.new_zeros((batch_size, h * w)); boundary = boxes.new_zeros((batch_size, h * w))
+            center = boxes.new_zeros((batch_size, h * w))
+            boundary = boxes.new_zeros((batch_size, h * w))
             yy, xx = self._grid_cache.get(boxes, h, w, centers=True)
             flat_index = batch_idx.long().view(-1, 1) * (h * w) + torch.arange(h * w, device=boxes.device).view(1, -1)
             for start in range(0, boxes.shape[0], self.chunk_size):
-                box = boxes[start:start + self.chunk_size]
-                if box.numel() == 0: continue
+                box = boxes[start : start + self.chunk_size]
+                if box.numel() == 0:
+                    continue
                 cx, cy, bw, bh = (box[:, 0] * w, box[:, 1] * h, box[:, 2] * w, box[:, 3] * h)
-                sx = (bw * self.center_sigma_ratio).clamp_min(self.min_sigma); sy = (bh * self.center_sigma_ratio).clamp_min(self.min_sigma)
-                cm = weights[start:start + len(box), level, None, None] * torch.exp(-0.5 * (((xx-cx[:,None,None])/sx[:,None,None]).square() + ((yy-cy[:,None,None])/sy[:,None,None]).square()))
-                left, right, top, bottom = cx-bw/2, cx+bw/2, cy-bh/2, cy+bh/2
-                edge = torch.minimum(torch.minimum((xx-left[:,None,None]).abs(), (xx-right[:,None,None]).abs()), torch.minimum((yy-top[:,None,None]).abs(), (yy-bottom[:,None,None]).abs()))
-                region = (xx >= (left-bw*self.boundary_expand)[:,None,None]) & (xx <= (right+bw*self.boundary_expand)[:,None,None]) & (yy >= (top-bh*self.boundary_expand)[:,None,None]) & (yy <= (bottom+bh*self.boundary_expand)[:,None,None])
-                bm = weights[start:start + len(box), level, None, None] * torch.exp(-edge.square()/(2*self.boundary_sigma**2)) * region
-                idx = flat_index[start:start + len(box)]
+                sx = (bw * self.center_sigma_ratio).clamp_min(self.min_sigma)
+                sy = (bh * self.center_sigma_ratio).clamp_min(self.min_sigma)
+                cm = weights[start : start + len(box), level, None, None] * torch.exp(
+                    -0.5
+                    * (
+                        ((xx - cx[:, None, None]) / sx[:, None, None]).square()
+                        + ((yy - cy[:, None, None]) / sy[:, None, None]).square()
+                    )
+                )
+                left, right, top, bottom = cx - bw / 2, cx + bw / 2, cy - bh / 2, cy + bh / 2
+                edge = torch.minimum(
+                    torch.minimum((xx - left[:, None, None]).abs(), (xx - right[:, None, None]).abs()),
+                    torch.minimum((yy - top[:, None, None]).abs(), (yy - bottom[:, None, None]).abs()),
+                )
+                region = (
+                    (xx >= (left - bw * self.boundary_expand)[:, None, None])
+                    & (xx <= (right + bw * self.boundary_expand)[:, None, None])
+                    & (yy >= (top - bh * self.boundary_expand)[:, None, None])
+                    & (yy <= (bottom + bh * self.boundary_expand)[:, None, None])
+                )
+                bm = (
+                    weights[start : start + len(box), level, None, None]
+                    * torch.exp(-edge.square() / (2 * self.boundary_sigma**2))
+                    * region
+                )
+                idx = flat_index[start : start + len(box)]
                 center.view(-1).scatter_reduce_(0, idx.reshape(-1), cm.reshape(-1), reduce="amax", include_self=True)
                 boundary.view(-1).scatter_reduce_(0, idx.reshape(-1), bm.reshape(-1), reduce="amax", include_self=True)
-            centers.append(center.view(batch_size,1,h,w).clamp_(0,1)); boundaries.append(boundary.view(batch_size,1,h,w).clamp_(0,1))
+            centers.append(center.view(batch_size, 1, h, w).clamp_(0, 1))
+            boundaries.append(boundary.view(batch_size, 1, h, w).clamp_(0, 1))
         return centers, boundaries
