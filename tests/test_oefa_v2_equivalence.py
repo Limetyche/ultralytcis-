@@ -11,7 +11,6 @@ from ultralytics.nn.modules import Detect
 from ultralytics.nn.modules.oefa import EvidenceGuidedSampler, EvidenceTargetGenerator
 from ultralytics.nn.modules.oefa_v2 import EvidenceTargetGeneratorV2, OEFAGuidedSamplerV2
 
-
 IDENTITY = "ultralytics/cfg/models/oefa/yolo11n-oefa-identity-v2.yaml"
 M1 = "ultralytics/cfg/models/oefa/yolo11n-oefa-m1-v2.yaml"
 
@@ -50,19 +49,20 @@ def test_sampler_v2_fp32_equivalence():
     torch.manual_seed(11)
     old = EvidenceGuidedSampler(16, 8, 4, 1.5, False).eval()
     new = OEFAGuidedSamplerV2(16, 8, 0, 4, 1.5, False).eval()
-    new.offset_mixer.load_state_dict(old.offset_mixer.state_dict()); new.alpha.data.copy_(old.alpha.data)
-    source, lateral, logits = torch.randn(2,16,5,7), torch.randn(2,8,10,14), torch.randn(2,1,10,14)
+    new.offset_mixer.load_state_dict(old.offset_mixer.state_dict())
+    new.alpha.data.copy_(old.alpha.data)
+    source, lateral, logits = torch.randn(2, 16, 5, 7), torch.randn(2, 8, 10, 14), torch.randn(2, 1, 10, 14)
     expected = old(source, lateral, logits)
-    actual = new([source, lateral, {"center_logits":[logits], "boundary_logits":[logits]}])
+    actual = new([source, lateral, {"center_logits": [logits], "boundary_logits": [logits]}])
     torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
 
 
 def test_vector_target_generator_fp32_equivalence():
-    boxes = torch.tensor([[.3,.4,.2,.15],[.32,.41,.1,.2],[.7,.7,.25,.3]], dtype=torch.float32)
-    batch_idx = torch.tensor([0,0,1])
-    shapes = [(2,1,16,20),(2,1,8,10),(2,1,4,5)]
-    old = EvidenceTargetGenerator()(batch_idx, boxes, 2, shapes, (128,160))[:2]
-    new = EvidenceTargetGeneratorV2(chunk_size=2)(batch_idx, boxes, 2, shapes, (128,160))
+    boxes = torch.tensor([[0.3, 0.4, 0.2, 0.15], [0.32, 0.41, 0.1, 0.2], [0.7, 0.7, 0.25, 0.3]], dtype=torch.float32)
+    batch_idx = torch.tensor([0, 0, 1])
+    shapes = [(2, 1, 16, 20), (2, 1, 8, 10), (2, 1, 4, 5)]
+    old = EvidenceTargetGenerator()(batch_idx, boxes, 2, shapes, (128, 160))[:2]
+    new = EvidenceTargetGeneratorV2(chunk_size=2)(batch_idx, boxes, 2, shapes, (128, 160))
     for old_group, new_group in zip(old, new):
         for a, b in zip(old_group, new_group):
             torch.testing.assert_close(a, b, atol=1e-5, rtol=1e-5)
@@ -90,7 +90,8 @@ def test_m1_v2_training_requires_evidence():
     model = YOLO(M1).model.train()
     model.args = get_cfg()
     batch = make_small_detection_batch()
-    preds = model(batch["img"]); preds.pop("evidence")
+    preds = model(batch["img"])
+    preds.pop("evidence")
     with pytest.raises(RuntimeError, match="evidence is missing"):
         model.loss(batch, preds)
 
