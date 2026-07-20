@@ -577,8 +577,13 @@ class OEFAM1V2DetectionLoss(v8DetectionLoss):
             # Native Detect intentionally keeps its standard eval API. Trainer validation reuses that inference output
             # for the ordinary three-component detection loss, without recomputing the OEFA auxiliary objective.
             return det_total.sum(), det_items
-        centers, boundaries = self.target_generator(batch["batch_idx"].long(), batch["bboxes"],
-            preds["boxes"].shape[0], [z.shape for z in evidence["center_logits"]], batch["img"].shape[-2:])
+        centers, boundaries = self.target_generator(
+            batch["batch_idx"].long(),
+            batch["bboxes"],
+            preds["boxes"].shape[0],
+            [z.shape for z in evidence["center_logits"]],
+            batch["img"].shape[-2:],
+        )
         losses = []
         if self.enable_center:
             losses.extend(self._channel_loss(x, y) for x, y in zip(evidence["center_logits"], centers))
@@ -604,7 +609,7 @@ class DASHM2LiteDetectionLoss(v8DetectionLoss):
 
     @staticmethod
     def _anchor_indices(feats: list[torch.Tensor], grids: list[tuple[int, int]], device: torch.device) -> torch.Tensor:
-        """Map each pooled anchor-token centre to its nearest dense prediction cell."""
+        """Map each pooled anchor-token center to its nearest dense prediction cell."""
         indices, offset = [], 0
         for feat, (gh, gw) in zip(feats, grids):
             h, w = feat.shape[-2:]
@@ -702,8 +707,7 @@ class DASHM2LiteDetectionLoss(v8DetectionLoss):
 
 
 class HGALDetectionLoss:
-    """
-    Main YOLO detection loss plus weighted HGAL auxiliary loss.
+    """Main YOLO detection loss plus weighted HGAL auxiliary loss.
 
     Main head:
         P3/P4/P5, strides [8, 16, 32]
@@ -728,9 +732,7 @@ class HGALDetectionLoss:
         head = model.model[-1]
 
         if not hasattr(head, "aux_weight"):
-            raise TypeError(
-                "HGALDetectionLoss requires an HGALDetect head."
-            )
+            raise TypeError("HGALDetectionLoss requires an HGALDetect head.")
 
         self.device = next(model.parameters()).device
         self.aux_weight = float(head.aux_weight)
@@ -759,8 +761,7 @@ class HGALDetectionLoss:
         # HGALDetect.bias_init() initializes this from the
         # selected main feature level, normally tensor([16.]).
         aux_stride = (
-            head.aux_stride
-            .detach()
+            head.aux_stride.detach()
             .clone()
             .to(
                 device=self.aux_loss.device,
@@ -776,10 +777,7 @@ class HGALDetectionLoss:
             )
 
         if float(aux_stride[0].item()) <= 0:
-            raise ValueError(
-                "HGAL auxiliary stride has not been initialized: "
-                f"{aux_stride.tolist()}."
-            )
+            raise ValueError(f"HGAL auxiliary stride has not been initialized: {aux_stride.tolist()}.")
 
         # make_anchors() inside v8DetectionLoss uses this stride.
         self.aux_loss.stride = aux_stride
@@ -802,9 +800,7 @@ class HGALDetectionLoss:
         preds,
         batch: dict[str, torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Training:
-            main loss + weighted auxiliary loss
+        """Training: main loss + weighted auxiliary loss.
 
         Validation:
             main loss only, because HGALDetect does not execute
@@ -813,10 +809,7 @@ class HGALDetectionLoss:
         preds = self.main_loss.parse_output(preds)
 
         if not isinstance(preds, dict):
-            raise TypeError(
-                "HGALDetectionLoss expects prediction dict, "
-                f"but got {type(preds).__name__}."
-            )
+            raise TypeError(f"HGALDetectionLoss expects prediction dict, but got {type(preds).__name__}.")
 
         main_preds = {
             "boxes": preds["boxes"],
@@ -858,12 +851,9 @@ class HGALDetectionLoss:
         # tensor([box_loss, cls_loss, dfl_loss])
         weighted_aux_total = aux_total * aux_gain
 
-        weighted_aux_items = (
-            aux_items
-            * aux_gain.to(
-                device=aux_items.device,
-                dtype=aux_items.dtype,
-            )
+        weighted_aux_items = aux_items * aux_gain.to(
+            device=aux_items.device,
+            dtype=aux_items.dtype,
         )
 
         total = main_total + weighted_aux_total
@@ -887,6 +877,7 @@ class HGALDetectionLoss:
             self._printed = True
 
         return total, loss_items
+
 
 class v8SegmentationLoss(v8DetectionLoss):
     """Criterion class for computing training losses for YOLOv8 segmentation."""

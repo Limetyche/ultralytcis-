@@ -15,7 +15,18 @@ from ultralytics.utils import NOT_MACOS14
 from ultralytics.utils.tal import dist2bbox, dist2rbox, make_anchors
 from ultralytics.utils.torch_utils import TORCH_1_11, fuse_conv_and_bn, smart_inference_mode
 
-from .block import DFL, SAVPE, BNContrastiveHead, ContrastiveHead, Proto, Proto26, RealNVP, Residual, SwiGLUFFN, AdaHGComputation
+from .block import (
+    DFL,
+    SAVPE,
+    AdaHGComputation,
+    BNContrastiveHead,
+    ContrastiveHead,
+    Proto,
+    Proto26,
+    RealNVP,
+    Residual,
+    SwiGLUFFN,
+)
 from .conv import Conv, DWConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
@@ -24,6 +35,7 @@ __all__ = (
     "OBB",
     "Classify",
     "Detect",
+    "HGALDetect",
     "Pose",
     "RTDETRDecoder",
     "Segment",
@@ -31,7 +43,6 @@ __all__ = (
     "YOLOEDetect",
     "YOLOESegment",
     "v10Detect",
-    "HGALDetect",
 )
 
 
@@ -1868,6 +1879,7 @@ class SemanticSegment(nn.Module):
             return F.interpolate(logits, scale_factor=8, mode="bilinear", align_corners=False)
         return logits
 
+
 class HGALDetect(Detect):
     def __init__(
         self,
@@ -1884,21 +1896,13 @@ class HGALDetect(Detect):
         ch=(),
     ):
         if end2end:
-            raise ValueError(
-                "HGALDetect is designed for standard "
-                "one-to-many detection, not end2end mode."
-            )
+            raise ValueError("HGALDetect is designed for standard one-to-many detection, not end2end mode.")
 
         if not ch:
-            raise ValueError(
-                "HGALDetect requires non-empty input channels."
-            )
+            raise ValueError("HGALDetect requires non-empty input channels.")
 
         if not 0 <= aux_index < len(ch):
-            raise ValueError(
-                f"aux_index={aux_index} is invalid for "
-                f"{len(ch)} feature levels."
-            )
+            raise ValueError(f"aux_index={aux_index} is invalid for {len(ch)} feature levels.")
 
         super().__init__(
             nc=nc,
@@ -1917,14 +1921,8 @@ class HGALDetect(Detect):
 
         aux_ch = int(ch[self.aux_index])
 
-        if (
-            self.use_hypergraph
-            and aux_ch % self.num_heads != 0
-        ):
-            raise ValueError(
-                f"Auxiliary channels {aux_ch} must be divisible "
-                f"by num_heads={self.num_heads}."
-            )
+        if self.use_hypergraph and aux_ch % self.num_heads != 0:
+            raise ValueError(f"Auxiliary channels {aux_ch} must be divisible by num_heads={self.num_heads}.")
 
         self.aux_hyper = (
             AdaHGComputation(
@@ -2020,8 +2018,7 @@ class HGALDetect(Detect):
         self,
         x: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """
-        Run the single-scale auxiliary detection head.
+        """Run the single-scale auxiliary detection head.
 
         The standard Detect.forward_head() cannot be used here,
         because it loops over self.nl, which is 3 for P3/P4/P5,
@@ -2051,18 +2048,8 @@ class HGALDetect(Detect):
         self,
         x: list[torch.Tensor],
     ):
-        """
-        Training:
-            return {
-                "boxes": ...,
-                "scores": ...,
-                "feats": ...,
-                "aux": {
-                    "boxes": ...,
-                    "scores": ...,
-                    "feats": ...
-                }
-            }
+        """Training: return { "boxes": ..., "scores": ..., "feats": ..., "aux": { "boxes": ..., "scores": ..., "feats":
+        ... } }.
 
         Validation/inference:
             exactly the same output protocol as standard Detect.
@@ -2077,9 +2064,7 @@ class HGALDetect(Detect):
             aux_feature = x[self.aux_index]
             aux_feature = self.aux_hyper(aux_feature)
 
-            preds["aux"] = self.forward_aux_head(
-                aux_feature
-            )
+            preds["aux"] = self.forward_aux_head(aux_feature)
 
             return preds
 
@@ -2089,8 +2074,7 @@ class HGALDetect(Detect):
         return y if self.export else (y, preds)
 
     def bias_init(self):
-        """
-        Initialize both main and auxiliary detection biases.
+        """Initialize both main and auxiliary detection biases.
 
         DetectionModel computes the main strides before calling
         this method, so the auxiliary stride can be copied from
@@ -2099,21 +2083,13 @@ class HGALDetect(Detect):
         super().bias_init()
 
         if self.stride.numel() <= self.aux_index:
-            raise RuntimeError(
-                "Main detection strides have not been initialized."
-            )
+            raise RuntimeError("Main detection strides have not been initialized.")
 
-        selected_stride = self.stride[
-            self.aux_index
-        ].detach()
+        selected_stride = self.stride[self.aux_index].detach()
 
-        self.aux_stride.copy_(
-            selected_stride.reshape(1)
-        )
+        self.aux_stride.copy_(selected_stride.reshape(1))
 
-        stride_value = float(
-            self.aux_stride[0].item()
-        )
+        stride_value = float(self.aux_stride[0].item())
 
         for box_head, cls_head in zip(
             self.aux_cv2,
@@ -2121,16 +2097,10 @@ class HGALDetect(Detect):
         ):
             box_head[-1].bias.data[:] = 2.0
 
-            cls_head[-1].bias.data[: self.nc] = math.log(
-                5
-                / self.nc
-                / (640 / stride_value) ** 2
-            )
+            cls_head[-1].bias.data[: self.nc] = math.log(5 / self.nc / (640 / stride_value) ** 2)
 
     def remove_auxiliary(self):
-        """
-        Permanently remove training-only auxiliary parameters
-        before deployment or final parameter counting.
+        """Permanently remove training-only auxiliary parameters before deployment or final parameter counting.
         """
         self.aux_hyper = nn.Identity()
         self.aux_cv2 = None
