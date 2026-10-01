@@ -12,7 +12,6 @@ import torch
 from ultralytics.nn.tasks import DetectionModel
 from ultralytics.utils.torch_utils import get_flops, get_num_params
 
-
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MODEL = ROOT / "ultralytics/cfg/models/dash/yolov8n-dash-m1.yaml"
 
