@@ -81,7 +81,9 @@ def test_strict_yaml_builds_protocol_and_switches():
         assert head.enable_bottom_up is (name in {"boundary", "m1"})
         model.train()
         output = model(torch.randn(1, 3, 128, 128))
-        assert set(output) == ({"boxes", "scores", "feats"} if name == "identity" else {"boxes", "scores", "feats", "evidence"})
+        assert set(output) == (
+            {"boxes", "scores", "feats"} if name == "identity" else {"boxes", "scores", "feats", "evidence"}
+        )
         model.eval()
         with torch.no_grad():
             decoded, raw = model(torch.randn(1, 3, 160, 160))

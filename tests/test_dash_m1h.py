@@ -8,11 +8,10 @@ import torch
 import yaml
 from thop import profile
 
+from ultralytics.cfg import get_cfg
 from ultralytics.nn.modules.block import C2f, DSC3k2
 from ultralytics.nn.tasks import DetectionModel
-from ultralytics.cfg import get_cfg
 from ultralytics.utils.torch_utils import get_flops, get_num_params
-
 
 ROOT = Path("ultralytics/cfg/models/dash")
 H1 = ROOT / "yolov8n-hybrid-neck.yaml"
