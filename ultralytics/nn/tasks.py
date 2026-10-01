@@ -8,7 +8,7 @@ from copy import deepcopy
 from pathlib import Path
 
 import torch
-import torch.nn as nn
+from torch import nn
 
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.modules import (
@@ -18,6 +18,7 @@ from ultralytics.nn.modules import (
     C2PSA,
     C3,
     C3TR,
+    CSHIA,
     ELAN1,
     OBB,
     OBB26,
@@ -44,17 +45,34 @@ from ultralytics.nn.modules import (
     Conv,
     Conv2,
     ConvTranspose,
+    DARTDetect,
+    DASHDetect,
+    DASHDetectEfficient,
+    DASHDetectM2Lite,
     Detect,
+    DownsampleConv,
+    DSC3k2,
+    DSConv,
     DWConv,
     DWConvTranspose2d,
     Focus,
+    FullPAD_Tunnel,
     GhostBottleneck,
     GhostConv,
+    HGALDetect,
     HGBlock,
+    HGD_Tunnel,
     HGStem,
+    HyperACE,
     ImagePoolingAttn,
     Index,
     LRPCHead,
+    MASDown,
+    MASSRUp,
+    OEFABoundaryDownsampleV2,
+    OEFAEvidencePredictorV2,
+    OEFAGuidedSamplerV2,
+    OEFAM1Detect,
     Pose,
     Pose26,
     RepC3,
@@ -73,38 +91,19 @@ from ultralytics.nn.modules import (
     YOLOESegment,
     YOLOESegment26,
     v10Detect,
-    MASDown,
-    MASSRUp,
-    DSConv,
-    HyperACE,
-    AdaHGComputation,
-    DownsampleConv,
-    FullPAD_Tunnel,
-    DSC3k2,
-    HGD_Tunnel,
-    HGALDetect,
-    CSHIA,
-    DASHDetect,
-    DASHDetectEfficient,
-    DASHDetectM2Lite,
-    DARTDetect,
-    OEFAM1Detect,
-    OEFABoundaryDownsampleV2,
-    OEFAEvidencePredictorV2,
-    OEFAGuidedSamplerV2,
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, LOGGER, SETTINGS, WINDOWS, YAML, colorstr, emojis
 from ultralytics.utils.checks import REMOTE_FILE_PREFIXES, check_file, check_requirements, check_suffix, check_yaml
 from ultralytics.utils.loss import (
+    DASHM2LiteDetectionLoss,
     E2ELoss,
+    HGALDetectionLoss,
+    OEFAM1DetectionLoss,
+    OEFAM1V2DetectionLoss,
     PoseLoss26,
     SemanticSegmentationLoss,
     v8ClassificationLoss,
     v8DetectionLoss,
-    HGALDetectionLoss,
-    DASHM2LiteDetectionLoss,
-    OEFAM1DetectionLoss,
-    OEFAM1V2DetectionLoss,
     v8OBBLoss,
     v8PoseLoss,
     v8SegmentationLoss,
@@ -556,11 +555,8 @@ class DetectionModel(BaseModel):
         if getattr(self, "oefa_evidence_layer", None) is not None:
             return OEFAM1V2DetectionLoss(self)
 
-        return (
-            E2ELoss(self)
-            if getattr(self, "end2end", False)
-            else v8DetectionLoss(self)
-        )
+        return E2ELoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
+
 
 class OBBModel(DetectionModel):
     """YOLO Oriented Bounding Box (OBB) model.
@@ -1497,11 +1493,9 @@ class SafeClass:
 
     def __init__(self, *args, **kwargs):
         """Initialize SafeClass instance, ignoring all arguments."""
-        pass
 
     def __call__(self, *args, **kwargs):
         """Run SafeClass instance, ignoring all arguments."""
-        pass
 
 
 class SafeUnpickler(pickle.Unpickler):
@@ -1789,9 +1783,9 @@ def parse_model(d, ch, verbose=True):
                     args[j] = locals()[a] if a in locals() else ast.literal_eval(a)
         n = n_ = max(round(n * depth), 1) if n > 1 else n  # depth gain
         if m is MASSRUp:
-          c1 = ch[f]
-          c2 = c1
-          args = [c1, *args]
+            c1 = ch[f]
+            c2 = c1
+            args = [c1, *args]
         elif m in base_modules:
             c1, c2 = ch[f], args[0]
             if c2 != nc:  # if c2 != nc (e.g., Classify() output)
@@ -1842,7 +1836,7 @@ def parse_model(d, ch, verbose=True):
             c2 = ch[f[0]]
             args = [c2, *args]
         elif m is AIFI:
-          args = [ch[f], *args]
+            args = [ch[f], *args]
         elif m is CSHIA:
             # 实际输入通道，例如 YOLOv8n 下是 [64, 128, 256]
             input_channels = [ch[x] for x in f]

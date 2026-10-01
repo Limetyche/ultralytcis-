@@ -13,7 +13,6 @@ from thop import profile
 from ultralytics.nn.tasks import DetectionModel
 from ultralytics.utils.torch_utils import get_flops, get_num_params
 
-
 ROOT = Path(__file__).resolve().parents[1]
 MODELS = {
     "B0": ROOT / "ultralytics/cfg/models/v8/yolov8.yaml",
@@ -105,10 +104,7 @@ def profile_model(name: str, path: Path, imgsz: int, warmup: int, runs: int, dev
         routing_macs = head.routing.theoretical_macs(shapes)
         routing_breakdown = head.routing.theoretical_mac_breakdown(shapes)
         routing_inputs = (
-            [
-                torch.zeros(1, channels, height, width, device=device)
-                for channels, height, width in shapes
-            ],
+            [torch.zeros(1, channels, height, width, device=device) for channels, height, width in shapes],
         )
         routing_latency, routing_peak = timed_forward(head.routing, routing_inputs, warmup, runs, device)
         routing_info = layer_info[str(len(model.model) - 1)][2]["routing"][2]
@@ -125,9 +121,10 @@ def profile_model(name: str, path: Path, imgsz: int, warmup: int, runs: int, dev
             print(f"  theory/{operation:<25} {operation_macs:>12,} MACs")
         tokens = sum(h * w for h, w in head.routing.encoder.anchor_grid_sizes)
         dense_nodes = sum(h * w for _, h, w in shapes)
-        edge_count = int(head.routing.enable_semantic) * head.routing.semantic_readout.num_edges + int(
-            head.routing.enable_geometry
-        ) * head.routing.geometry_readout.num_edges
+        edge_count = (
+            int(head.routing.enable_semantic) * head.routing.semantic_readout.num_edges
+            + int(head.routing.enable_geometry) * head.routing.geometry_readout.num_edges
+        )
         softmax_elements = (tokens + dense_nodes) * edge_count
         print(f"routing_softmax_elements={softmax_elements:,} (not MACs; FP32 exp/reduction/division)")
         print(f"routing_latency_ms={routing_latency:.4f} routing_peak_memory_mb={routing_peak}")
