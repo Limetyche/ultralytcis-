@@ -12,7 +12,6 @@ from ultralytics.nn.modules.dash import DASHRoutingBlockEfficient
 from ultralytics.nn.tasks import DetectionModel
 from ultralytics.utils.torch_utils import get_flops, get_num_params
 
-
 ROOT = Path("ultralytics/cfg/models")
 B0 = ROOT / "v8/yolov8.yaml"
 B1 = ROOT / "dash/yolov8n-dash-m1e-neck.yaml"
