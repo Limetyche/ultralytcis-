@@ -51,6 +51,7 @@ def cuda_profile(model, image, warmup, runs):
         for name, modules in categories.items():
             pairs, handles = [], []
             for module in modules:
+
                 def pre_hook(_module, _inputs, pairs=pairs):
                     event = torch.cuda.Event(enable_timing=True)
                     event.record()

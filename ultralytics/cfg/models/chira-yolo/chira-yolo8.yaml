@@ -17,54 +17,54 @@ scales: # model compound scaling constants, i.e. 'model=yolov8n.yaml' will call 
 # YOLOv8.0n head
 backbone:
   # [from, repeats, module, args]
-  - [-1, 1, Conv, [64, 3, 2]]   # 0-P1/2
-  - [-1, 1, Conv, [128, 3, 2]]  # 1-P2/4
+  - [-1, 1, Conv, [64, 3, 2]] # 0-P1/2
+  - [-1, 1, Conv, [128, 3, 2]] # 1-P2/4
 
   # Shallow: lightweight DSBottleneck, k2=5
-  - [-1, 3, DSC3k2, [128, False, 0.5, 1, True, 3, 5, 1]]  # 2
+  - [-1, 3, DSC3k2, [128, False, 0.5, 1, True, 3, 5, 1]] # 2
 
-  - [-1, 1, Conv, [256, 3, 2]]  # 3-P3/8
-  - [-1, 6, DSC3k2, [256, False, 0.5, 1, True, 3, 5, 1]]  # 4
+  - [-1, 1, Conv, [256, 3, 2]] # 3-P3/8
+  - [-1, 6, DSC3k2, [256, False, 0.5, 1, True, 3, 5, 1]] # 4
 
-  - [-1, 1, Conv, [512, 3, 2]]  # 5-P4/16
+  - [-1, 1, Conv, [512, 3, 2]] # 5-P4/16
 
   # Deep: nested DSC3k, k2=7
-  - [-1, 6, DSC3k2, [512, True, 0.5, 1, True, 3, 7, 1]]   # 6
+  - [-1, 6, DSC3k2, [512, True, 0.5, 1, True, 3, 7, 1]] # 6
 
   - [-1, 1, Conv, [1024, 3, 2]] # 7-P5/32
-  - [-1, 3, DSC3k2, [1024, True, 0.5, 1, True, 3, 7, 1]]  # 8
+  - [-1, 3, DSC3k2, [1024, True, 0.5, 1, True, 3, 7, 1]] # 8
 
-  - [-1, 1, SPPF, [1024, 5]]  # 9
+  - [-1, 1, SPPF, [1024, 5]] # 9
 
 head:
   # Multi-scale hypergraph interaction
   - [[4, 6, 9], 1, CSHIA, [512, 4, 4, 0.25, "both", 0.0]]
 
   # Top-down P5 -> P4
-  - [9, 1, nn.Upsample, [None, 2, "nearest"]]          # 11
-  - [[-1, 6], 1, Concat, [1]]                          # 12
+  - [9, 1, nn.Upsample, [None, 2, "nearest"]] # 11
+  - [[-1, 6], 1, Concat, [1]] # 12
 
   # P4 uses semantic-enhanced DSC3k2
-  - [-1, 3, DSC3k2, [512, True, 0.5, 1, True, 3, 7, 1]]  # 13
+  - [-1, 3, DSC3k2, [512, True, 0.5, 1, True, 3, 7, 1]] # 13
 
   # Hypergraph-guided injection
-  - [[13, 10], 1, HGD_Tunnel, [8, -4.0]]                    # 14
+  - [[13, 10], 1, HGD_Tunnel, [8, -4.0]] # 14
 
   # Top-down P4 -> P3
-  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]         # 15
-  - [[-1, 4], 1, Concat, [1]]                          # 16
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]] # 15
+  - [[-1, 4], 1, Concat, [1]] # 16
 
   # P3 preserves finer features
-  - [-1, 3, DSC3k2, [256, False, 0.5, 1, True, 3, 5, 1]]  # 17
+  - [-1, 3, DSC3k2, [256, False, 0.5, 1, True, 3, 5, 1]] # 17
 
   # Bottom-up P3 -> P4
-  - [-1, 1, Conv, [256, 3, 2]]                         # 18
-  - [[-1, 14], 1, Concat, [1]]                         # 19
-  - [-1, 3, DSC3k2, [512, True, 0.5, 1, True, 3, 7, 1]]  # 20
+  - [-1, 1, Conv, [256, 3, 2]] # 18
+  - [[-1, 14], 1, Concat, [1]] # 19
+  - [-1, 3, DSC3k2, [512, True, 0.5, 1, True, 3, 7, 1]] # 20
 
   # Bottom-up P4 -> P5
-  - [-1, 1, Conv, [512, 3, 2]]                         # 21
-  - [[-1, 9], 1, Concat, [1]]                          # 22
+  - [-1, 1, Conv, [512, 3, 2]] # 21
+  - [[-1, 9], 1, Concat, [1]] # 22
   - [-1, 3, DSC3k2, [1024, True, 0.5, 1, True, 3, 7, 1]] # 23
 
-  - [[17, 20, 23], 1, Detect, [nc]]                    # 24
+  - [[17, 20, 23], 1, Detect, [nc]] # 24
