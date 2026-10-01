@@ -32,27 +32,27 @@ backbone:
 head:
   # CSHIA performs interaction at 64 hidden channels
   # and restores the output to 128 channels.
-  - [[4, 6, 9], 1, CSHIA, [512, 4, 4, 0.25, "both"]]            # 10
+  - [[4, 6, 9], 1, CSHIA, [512, 4, 4, 0.25, "both"]] # 10
 
   # Standard YOLOv8 top-down
-  - [9, 1, nn.Upsample, [None, 2, "nearest"]]                 # 11
-  - [[-1, 6], 1, Concat, [1]]             # 12
-  - [-1, 3, C2f, [512]]                    # 13, P4 128ch
+  - [9, 1, nn.Upsample, [None, 2, "nearest"]] # 11
+  - [[-1, 6], 1, Concat, [1]] # 12
+  - [-1, 3, C2f, [512]] # 13, P4 128ch
 
   # Only one hypergraph-guided injection
-  - [[13, 10], 1, HGD_Tunnel, []]          # 14, 128ch + 128ch
+  - [[13, 10], 1, HGD_Tunnel, []] # 14, 128ch + 128ch
 
-  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]                 # 15
-  - [[-1, 4], 1, Concat, [1]]             # 16
-  - [-1, 3, C2f, [256]]                    # 17, P3
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]] # 15
+  - [[-1, 4], 1, Concat, [1]] # 16
+  - [-1, 3, C2f, [256]] # 17, P3
 
   # Standard YOLOv8 bottom-up
-  - [-1, 1, Conv, [256, 3, 2]]             # 18
-  - [[-1, 14], 1, Concat, [1]]             # 19
-  - [-1, 3, C2f, [512]]                    # 20, P4
+  - [-1, 1, Conv, [256, 3, 2]] # 18
+  - [[-1, 14], 1, Concat, [1]] # 19
+  - [-1, 3, C2f, [512]] # 20, P4
 
-  - [-1, 1, Conv, [512, 3, 2]]             # 21
-  - [[-1, 9], 1, Concat, [1]]              # 22
-  - [-1, 3, C2f, [1024]]                   # 23, P5
+  - [-1, 1, Conv, [512, 3, 2]] # 21
+  - [[-1, 9], 1, Concat, [1]] # 22
+  - [-1, 3, C2f, [1024]] # 23, P5
 
-  - [[17, 20, 23], 1, Detect, [nc]]        # 24
+  - [[17, 20, 23], 1, Detect, [nc]] # 24
