@@ -7,7 +7,7 @@ import math
 from collections.abc import Sequence
 
 import torch
-import torch.nn as nn
+from torch import nn
 
 from .head import Detect
 
@@ -112,7 +112,9 @@ class DARTDetect(Detect):
         self.hidden_dim = int(hidden_dim)
         self.use_distribution_state = bool(use_distribution_state)
         self.scale_adaptive = bool(scale_adaptive)
-        self.state_encoder = DistributionStateEncoder(self.reg_max, detach=True) if self.use_distribution_state else None
+        self.state_encoder = (
+            DistributionStateEncoder(self.reg_max, detach=True) if self.use_distribution_state else None
+        )
         # P3/P4 retain dense nearest-neighbour sampling. P5 uses dilation 2 to expose uncertain large-object
         # edges to wider context at negligible parameter cost; the shared-scale control uses dilation 1 everywhere.
         dilations: Sequence[int] = (1, 1, 2) if self.scale_adaptive else (1, 1, 1)
@@ -150,7 +152,7 @@ class DARTDetect(Detect):
     ) -> dict[str, torch.Tensor]:
         """Preserve Detect's boxes/scores/feats protocol while replacing boxes with refined logits."""
         if box_head is None or cls_head is None:
-            return dict()
+            return {}
         bs = x[0].shape[0]
         refined, initial, states = self.refine_boxes(x, box_head)
         boxes = torch.cat([z.view(bs, 4 * self.reg_max, -1) for z in refined], dim=-1)
@@ -167,4 +169,4 @@ class DARTDetect(Detect):
             )
         else:
             self.last_diagnostics = None
-        return dict(boxes=boxes, scores=scores, feats=x)
+        return {"boxes": boxes, "scores": scores, "feats": x}
